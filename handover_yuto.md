@@ -11,7 +11,7 @@ reference: `reference/syugasato/deep-research-report.md`
 
 ### 0. ベースライン計測
 
-- [ ] `--decode io --key 5,0,17,5,3` の基準コマンドを固定
+- [x] `--decode io --key 5,0,17,5,3` の基準コマンドを固定
 - [ ] 3回実行して `max arena.nodes.len()` と所要時間のぶれを記録
 - [ ] `GC回数 / free_list最小値 / 深さごとの出力ファイル` を記録
 
@@ -62,6 +62,25 @@ cargo build --release
 ./target/release/ski-eval ../very_large_txt/stars_compact.txt \
   --fuel 2000000000 --decode io --key 5,0,17,5,3 --img ../images/zoom
 ```
+
+## ベースライン計測の実行手順
+
+```bash
+# 3回実行 + ログ保存 + 集計TSV生成
+./scripts/run_baseline_io.sh
+
+# 出力先例:
+# logs/baseline_io/20260218_211500/run1.log
+# logs/baseline_io/20260218_211500/run2.log
+# logs/baseline_io/20260218_211500/run3.log
+# logs/baseline_io/20260218_211500/summary.tsv
+```
+
+- ログ集計は `scripts/summarize_baseline_io.py` が実行し、以下を抽出する
+- `max arena.nodes.len()`（ログ上の `arena=*` / `Arena nodes: *` から最大値）
+- `GC回数`（`GC:` を含む行数）
+- `free_list最小値`（`free=*` / `free_list=*` の最小値）
+- `深さごとの出力ファイル`（`Saved: *_depth*.pgm`）
 
 ## 直近の優先順
 
