@@ -18,6 +18,9 @@ const K1: u8 = 6; // K applied to 1 arg
 const IND: u8 = 7; // Indirection (sharing/update)
 
 const NIL: u32 = u32::MAX;
+const ARENA_HARD_LIMIT: usize = 1_900_000_000;
+const IO_ALLOC_LIMIT_GROWTH_MULTIPLIER: usize = 8;
+const IO_ALLOC_LIMIT_MIN_HEADROOM: usize = 50_000_000;
 
 #[derive(Clone, Copy)]
 struct Node {
@@ -36,6 +39,7 @@ struct Arena {
     cached_marker_t: Option<u32>,
     cached_marker_f: Option<u32>,
     cached_diamond_sels: [Option<u32>; 5],
+    io_alloc_failsafe_limit: Option<usize>,
     // Checkpoint/restore for per-pixel rendering
     checkpoint: Option<usize>,     // arena length at checkpoint
     saved_nodes: Vec<(u32, Node)>, // base nodes modified since checkpoint
@@ -53,9 +57,15 @@ impl Arena {
             cached_marker_t: None,
             cached_marker_f: None,
             cached_diamond_sels: [None; 5],
+            io_alloc_failsafe_limit: None,
             checkpoint: None,
             saved_nodes: Vec::new(),
         }
+    }
+
+    #[inline]
+    fn enable_io_alloc_failsafe(&mut self, limit: usize) {
+        self.io_alloc_failsafe_limit = Some(limit.clamp(1, ARENA_HARD_LIMIT));
     }
 
     #[inline]
@@ -69,9 +79,36 @@ impl Arena {
             }
         }
         // Arena size limit: 1.9B nodes (~22.8GB) — push memory to the max
-        if self.nodes.len() >= 1_900_000_000 {
+        if self.nodes.len() >= ARENA_HARD_LIMIT {
             eprintln!("ARENA LIMIT: {} nodes reached, aborting", self.nodes.len());
             std::process::exit(1);
+        }
+        if let Some(limit) = self.io_alloc_failsafe_limit {
+            if self.nodes.len() >= limit {
+                let node_bytes = std::mem::size_of::<Node>() as u128;
+                let approx_mib = (self.nodes.len() as u128 * node_bytes) / (1024 * 1024);
+                eprintln!(
+                    "IO ALLOC FAILSAFE: nodes={} reached limit={} (~{} MiB node storage, free_list={}, checkpoint={}), aborting",
+                    self.nodes.len(),
+                    limit,
+                    approx_mib,
+                    self.free_list.len(),
+                    self.checkpoint.is_some()
+                );
+                std::process::exit(1);
+            }
+        }
+        if self.nodes.len() == self.nodes.capacity() {
+            if let Err(err) = self.nodes.try_reserve(1) {
+                eprintln!(
+                    "ALLOC FAILSAFE: reserve failed at nodes={} capacity={} free_list={} error={:?}",
+                    self.nodes.len(),
+                    self.nodes.capacity(),
+                    self.free_list.len(),
+                    err
+                );
+                std::process::exit(1);
+            }
         }
         let idx = self.nodes.len() as u32;
         self.nodes.push(Node { tag, a, b });
@@ -196,25 +233,25 @@ impl Arena {
         result
     }
 
-    /// Set a checkpoint: record current arena length for later restore
-    fn set_checkpoint(&mut self) {
-        self.checkpoint = Some(self.nodes.len());
-        self.saved_nodes.clear();
-    }
+    // /// Set a checkpoint: record current arena length for later restore
+    // fn set_checkpoint(&mut self) {
+    //     self.checkpoint = Some(self.nodes.len());
+    //     self.saved_nodes.clear();
+    // }
 
-    /// Restore arena to checkpoint state: undo all base node modifications
-    /// and truncate new allocations
-    fn restore_checkpoint(&mut self) {
-        if let Some(cp) = self.checkpoint {
-            // Restore modified base nodes in reverse order
-            for (idx, node) in self.saved_nodes.drain(..).rev() {
-                self.nodes[idx as usize] = node;
-            }
-            // Truncate temporary allocations
-            self.nodes.truncate(cp);
-            self.checkpoint = None;
-        }
-    }
+    // /// Restore arena to checkpoint state: undo all base node modifications
+    // /// and truncate new allocations
+    // fn restore_checkpoint(&mut self) {
+    //     if let Some(cp) = self.checkpoint {
+    //         // Restore modified base nodes in reverse order
+    //         for (idx, node) in self.saved_nodes.drain(..).rev() {
+    //             self.nodes[idx as usize] = node;
+    //         }
+    //         // Truncate temporary allocations
+    //         self.nodes.truncate(cp);
+    //         self.checkpoint = None;
+    //     }
+    // }
 
     /// Mark-sweep garbage collection.
     /// `roots` are the node indices that must be kept alive.
@@ -757,7 +794,7 @@ fn decode_bool_list(arena: &mut Arena, node: u32, fuel: u64, max_items: usize) -
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: ski-eval <compact-file> [--fuel N] [--decode list|stream|bool|num|boollist|describe]");
+        eprintln!("Usage: ski-eval <compact-file> [--fuel N] [--decode list|stream|bool|num|boollist|describe|io] [--io-alloc-limit N]");
         process::exit(1);
     }
 
@@ -768,6 +805,7 @@ fn main() {
     let mut grid_size: u64 = 0; // 0 = use render_var as grid size
     let mut img_path = "d:/github/atgt2026hp_stars/images/rendered".to_string();
     let mut key_codes: Vec<u64> = Vec::new(); // --key 5,0,17,5,3
+    let mut io_alloc_limit: Option<usize> = None; // --io-alloc-limit N
 
     let mut i = 2;
     while i < args.len() {
@@ -799,6 +837,10 @@ fn main() {
                     .map(|s| s.trim().parse::<u64>().expect("invalid key code"))
                     .collect();
                 eprintln!("Key codes: {:?}", key_codes);
+            }
+            "--io-alloc-limit" => {
+                i += 1;
+                io_alloc_limit = Some(args[i].parse().expect("invalid io-alloc-limit value"));
             }
             _ => {
                 eprintln!("Unknown option: {}", args[i]);
@@ -1073,7 +1115,7 @@ fn main() {
                     if height < 10 {
                         continue;
                     }
-                    let mut pixels: Vec<u8> = lvs[..width * height]
+                    let pixels: Vec<u8> = lvs[..width * height]
                         .iter()
                         .map(|&b| if b == 1 { 0u8 } else { 255u8 })
                         .collect();
@@ -1310,7 +1352,7 @@ fn main() {
             eprintln!("Rendering {}x{} image (N={})...", size, size, size);
 
             let mut pixels = vec![128u8; (size * size) as usize]; // default gray
-            let mut decoded_count = 0u64;
+                                                                  // let mut decoded_count = 0u64;
             let mut bool_count = 0u64;
             let mut num_count = 0u64;
             let mut fail_count = 0u64;
@@ -1377,11 +1419,11 @@ fn main() {
                     if let Some(n) = decode_scott_num(&mut arena, val, 1_000_000) {
                         pixels[(m * size + z) as usize] = (n.min(255)) as u8;
                         num_count += 1;
-                        decoded_count += 1;
+                        // decoded_count += 1;
                     } else if let Some(b) = decode_bool(&mut arena, val, 500_000) {
                         pixels[(m * size + z) as usize] = if b { 255 } else { 0 };
                         bool_count += 1;
-                        decoded_count += 1;
+                        // decoded_count += 1;
                     } else {
                         fail_count += 1;
                         if fail_examples.len() < 5 {
@@ -1911,7 +1953,7 @@ fn main() {
 
             for n in n_start..=n_end {
                 let mut pixel_vals: Vec<(u64, u64, String)> = Vec::new();
-                let mut all_ok = true;
+                // let mut all_ok = true;
 
                 for &(m, z) in &test_coords {
                     if m >= n || z >= n {
@@ -1958,7 +2000,7 @@ fn main() {
                             desc
                         };
                         pixel_vals.push((m, z, format!("?{}", d)));
-                        all_ok = false;
+                        // all_ok = false;
                     }
                 }
 
@@ -2014,7 +2056,7 @@ fn main() {
         "probe3" => {
             // Systematic probe: try result(a)(b)(c) for small values
             eprintln!("Probing result(a)(b)(c) systematically...");
-            let mut f = remaining_fuel;
+            let f = remaining_fuel;
 
             // Test with var=4 (16x16), small coords
             eprintln!("\n--- result(var)(m)(z) with var=4 ---");
@@ -2901,7 +2943,7 @@ fn main() {
             // Self-test: verify pair encoding, number encoding, and extraction
             eprintln!("=== Self-test: pair/number encoding ===\n");
             let mut ok = true;
-            let mut test_fuel: u64 = 1_000_000;
+            let test_fuel: u64 = 1_000_000;
 
             // Test 1: true(x)(y) = x
             {
@@ -3339,10 +3381,26 @@ fn main() {
             // p1=0: halt, p1=1: output, p1=2: input
             // Output: p2=0/1/2 for int/string/image, Q = pair1(data, continuation)
             // Input: p2=0/1 for int/string, Q = λx.continuation
+            let io_start_nodes = arena.nodes.len();
+            let io_dynamic_limit = io_start_nodes
+                .saturating_mul(IO_ALLOC_LIMIT_GROWTH_MULTIPLIER)
+                .max(io_start_nodes.saturating_add(IO_ALLOC_LIMIT_MIN_HEADROOM))
+                .min(ARENA_HARD_LIMIT);
+            let io_limit = io_alloc_limit
+                .unwrap_or(io_dynamic_limit)
+                .clamp(1, ARENA_HARD_LIMIT);
+            arena.enable_io_alloc_failsafe(io_limit);
+            eprintln!(
+                "I/O alloc failsafe: start_nodes={}, limit_nodes={}, free_list={}",
+                io_start_nodes,
+                io_limit,
+                arena.free_list.len()
+            );
+
             // Quick self-test of pair2 extraction
             {
                 let true_node = make_true(&mut arena);
-                let false_node = make_false(&mut arena);
+                // let false_node = make_false(&mut arena);
                 // Build a list: cons(nil, true) = pair2(false_node, true_node)
                 let nil = make_false(&mut arena);
                 let list1 = make_pair(&mut arena, nil, true_node);
@@ -3392,10 +3450,10 @@ fn main() {
                                                 // Church 5-tuple: λh. h(a)(b)(c)(d)(e)
                                                 // = S(S(S(S(SI)(Ka))(Kb))(Kc))(Kd))(Ke)
                 let i_n = arena.alloc(I, NIL, NIL);
-                let k_n = arena.alloc(K, NIL, NIL);
+                // let k_n = arena.alloc(K, NIL, NIL);
                 // Build S(I)(K(a)) step by step
                 let ka = arena.alloc(K1, t, NIL); // K(true)
-                let si = arena.alloc(S1, i_n, NIL); // S(I)
+                                                  // let si = arena.alloc(S1, i_n, NIL); // S(I)
                 let si_ka = arena.alloc(S2, i_n, ka); // S(I)(K(true))
                 let kb = arena.alloc(K1, f, NIL); // K(false)
                 let s_sika_kb = arena.alloc(S2, si_ka, kb); // S(S(I)(K(true)))(K(false))
@@ -3598,7 +3656,9 @@ fn main() {
                                 use std::collections::HashMap;
                                 let mut child_cache: HashMap<u32, [u32; 4]> = HashMap::new();
                                 let mut bool_cache: HashMap<u32, Option<bool>> = HashMap::new();
-                                let eval_fuel: u64 = 500_000_000;
+                                let child_eval_fuel: u64 = 120_000_000;
+                                let probe_bool_eval_fuel: u64 = 12_000_000;
+                                let render_eval_fuel: u64 = 40_000_000;
 
                                 // Helper: extract i-th child (1=TL, 2=TR, 3=BL, 4=BR)
                                 fn get_child_fn(
@@ -3645,6 +3705,62 @@ fn main() {
                                     b
                                 }
 
+                                fn calc_gc_min_free(arena: &Arena, io_limit: usize) -> usize {
+                                    let remaining = io_limit.saturating_sub(arena.nodes.len());
+                                    (remaining / 3).clamp(5_000_000, 60_000_000)
+                                }
+
+                                fn gc_zoom_roots(
+                                    arena: &mut Arena,
+                                    sels: &[u32; 5],
+                                    zoom_roots: [u32; 4],
+                                    child_cache: &mut HashMap<u32, [u32; 4]>,
+                                    bool_cache: &mut HashMap<u32, Option<bool>>,
+                                    label: &str,
+                                ) {
+                                    let mut roots: Vec<u32> = Vec::new();
+                                    for &s in sels {
+                                        roots.push(s);
+                                    }
+                                    roots.extend_from_slice(&zoom_roots);
+                                    for (&parent, children) in child_cache.iter() {
+                                        roots.push(parent);
+                                        for &c in children {
+                                            roots.push(c);
+                                        }
+                                    }
+                                    for &node in bool_cache.keys() {
+                                        roots.push(node);
+                                    }
+                                    let (total, live, freed) = arena.gc(&roots);
+                                    eprintln!(
+                                        "    {} GC: total={}, live={}, freed={}, free={}",
+                                        label,
+                                        total,
+                                        live,
+                                        freed,
+                                        arena.free_list.len()
+                                    );
+                                }
+
+                                fn maybe_gc_zoom(
+                                    arena: &mut Arena,
+                                    sels: &[u32; 5],
+                                    zoom_roots: [u32; 4],
+                                    child_cache: &mut HashMap<u32, [u32; 4]>,
+                                    bool_cache: &mut HashMap<u32, Option<bool>>,
+                                    io_limit: usize,
+                                    label: &str,
+                                ) {
+                                    let min_free = calc_gc_min_free(arena, io_limit);
+                                    if arena.free_list.len() >= min_free {
+                                        return;
+                                    }
+                                    child_cache.clear();
+                                    bool_cache.clear();
+                                    gc_zoom_roots(arena, sels, zoom_roots, child_cache, bool_cache, label);
+                                }
+
                                 // Render at multiple depths per the hint-new-2 strategy
                                 // Depth 1-8: render at 2^(depth-1) resolution
                                 // Depth 9-25: zoom into center 1/2, render at 128x128
@@ -3658,7 +3774,7 @@ fn main() {
                                     1,
                                     &sels,
                                     &mut child_cache,
-                                    eval_fuel,
+                                    child_eval_fuel,
                                 );
                                 let root_tr = get_child_fn(
                                     &mut arena,
@@ -3666,7 +3782,7 @@ fn main() {
                                     2,
                                     &sels,
                                     &mut child_cache,
-                                    eval_fuel,
+                                    child_eval_fuel,
                                 );
                                 let root_bl = get_child_fn(
                                     &mut arena,
@@ -3674,7 +3790,7 @@ fn main() {
                                     3,
                                     &sels,
                                     &mut child_cache,
-                                    eval_fuel,
+                                    child_eval_fuel,
                                 );
                                 let root_br = get_child_fn(
                                     &mut arena,
@@ -3682,7 +3798,7 @@ fn main() {
                                     4,
                                     &sels,
                                     &mut child_cache,
-                                    eval_fuel,
+                                    child_eval_fuel,
                                 );
                                 eprintln!(
                                     "  Root children extracted. Arena: {}",
@@ -3702,8 +3818,7 @@ fn main() {
                                     size: usize, // output image size (must be power of 2, >= 2)
                                     sels: &[u32; 5],
                                     fuel_per_pixel: u64,
-                                    gc_extra_roots: &[u32],
-                                    gc_threshold: usize,
+                                    gc_min_free: usize,
                                 ) -> Vec<u8> {
                                     let half = size / 2;
                                     let depth_within = if half <= 1 {
@@ -3809,7 +3924,7 @@ fn main() {
                                             );
                                         }
                                         // GC when free list runs low (every row check)
-                                        if arena.free_list.len() < 10_000_000 {
+                                        if arena.free_list.len() < gc_min_free {
                                             let mut roots: Vec<u32> = Vec::new();
                                             for &s in sels {
                                                 roots.push(s);
@@ -3817,7 +3932,6 @@ fn main() {
                                             for &r in &sub_roots {
                                                 roots.push(r);
                                             }
-                                            roots.extend_from_slice(gc_extra_roots);
                                             let (total, live, freed) = arena.gc(&roots);
                                             eprintln!(
                                                 "      GC: total={}, live={}, freed={}, free={}",
@@ -3831,50 +3945,15 @@ fn main() {
                                     pixels
                                 }
 
-                                // GC helper: collect all live roots from caches + current state
-                                fn do_gc(
-                                    arena: &mut Arena,
-                                    sels: &[u32; 5],
-                                    extra_roots: &[u32],
-                                    child_cache: &mut HashMap<u32, [u32; 4]>,
-                                    bool_cache: &mut HashMap<u32, Option<bool>>,
-                                ) {
-                                    let mut roots: Vec<u32> = Vec::new();
-                                    // Selectors
-                                    for &s in sels {
-                                        roots.push(s);
-                                    }
-                                    // Extra roots (zoom nodes, data, etc)
-                                    roots.extend_from_slice(extra_roots);
-                                    // All cached child nodes (both keys and values)
-                                    for (&parent, children) in child_cache.iter() {
-                                        roots.push(parent);
-                                        for &c in children {
-                                            roots.push(c);
-                                        }
-                                    }
-                                    // All cached bool keys
-                                    for &node in bool_cache.keys() {
-                                        roots.push(node);
-                                    }
-                                    let (total, live, freed) = arena.gc(&roots);
-                                    eprintln!(
-                                        "  GC: total={}, live={}, freed={}, free_list={}",
-                                        total,
-                                        live,
-                                        freed,
-                                        arena.free_list.len()
-                                    );
-                                }
-
                                 // Run GC before rendering to reclaim I/O processing garbage
                                 eprintln!("  Running initial GC...");
-                                do_gc(
+                                gc_zoom_roots(
                                     &mut arena,
                                     &sels,
-                                    &[data, root_tl, root_tr, root_bl, root_br],
+                                    [root_tl, root_tr, root_bl, root_br],
                                     &mut child_cache,
                                     &mut bool_cache,
+                                    "Initial",
                                 );
 
                                 // Phase 1: SKIPPED (all depths 1-8 are all-black)
@@ -3889,13 +3968,31 @@ fn main() {
 
                                 // Do zoom steps 1-8 first (without rendering, just navigate to center)
                                 for step in 1..=7 {
+                                    maybe_gc_zoom(
+                                        &mut arena,
+                                        &sels,
+                                        [zoom_tl, zoom_tr, zoom_bl, zoom_br],
+                                        &mut child_cache,
+                                        &mut bool_cache,
+                                        io_limit,
+                                        "Pre-zoom-step",
+                                    );
                                     let new_tl = get_child_fn(
                                         &mut arena,
                                         zoom_tl,
                                         4,
                                         &sels,
                                         &mut child_cache,
-                                        eval_fuel,
+                                        child_eval_fuel,
+                                    );
+                                    maybe_gc_zoom(
+                                        &mut arena,
+                                        &sels,
+                                        [zoom_tl, zoom_tr, zoom_bl, zoom_br],
+                                        &mut child_cache,
+                                        &mut bool_cache,
+                                        io_limit,
+                                        "Mid-zoom-step",
                                     );
                                     let new_tr = get_child_fn(
                                         &mut arena,
@@ -3903,7 +4000,7 @@ fn main() {
                                         3,
                                         &sels,
                                         &mut child_cache,
-                                        eval_fuel,
+                                        child_eval_fuel,
                                     );
                                     let new_bl = get_child_fn(
                                         &mut arena,
@@ -3911,7 +4008,7 @@ fn main() {
                                         2,
                                         &sels,
                                         &mut child_cache,
-                                        eval_fuel,
+                                        child_eval_fuel,
                                     );
                                     let new_br = get_child_fn(
                                         &mut arena,
@@ -3919,7 +4016,7 @@ fn main() {
                                         1,
                                         &sels,
                                         &mut child_cache,
-                                        eval_fuel,
+                                        child_eval_fuel,
                                     );
                                     zoom_tl = new_tl;
                                     zoom_tr = new_tr;
@@ -3939,25 +4036,27 @@ fn main() {
                                 eprintln!("  Clearing caches and running aggressive GC (zoom-only roots)...");
                                 child_cache.clear();
                                 bool_cache.clear();
-                                {
-                                    let mut roots: Vec<u32> = Vec::new();
-                                    for &s in &sels {
-                                        roots.push(s);
-                                    }
-                                    roots.extend_from_slice(&[zoom_tl, zoom_tr, zoom_bl, zoom_br]);
-                                    let (total, live, freed) = arena.gc(&roots);
-                                    eprintln!(
-                                        "  Aggressive GC: total={}, live={}, freed={}, free={}",
-                                        total,
-                                        live,
-                                        freed,
-                                        arena.free_list.len()
-                                    );
-                                }
+                                gc_zoom_roots(
+                                    &mut arena,
+                                    &sels,
+                                    [zoom_tl, zoom_tr, zoom_bl, zoom_br],
+                                    &mut child_cache,
+                                    &mut bool_cache,
+                                    "Aggressive",
+                                );
 
                                 // Now zoom_tl/tr/bl/br represent the center of depth 8
                                 // Continue zooming for depths 9-25, rendering at each depth
                                 for depth in 9..=max_depth {
+                                    maybe_gc_zoom(
+                                        &mut arena,
+                                        &sels,
+                                        [zoom_tl, zoom_tr, zoom_bl, zoom_br],
+                                        &mut child_cache,
+                                        &mut bool_cache,
+                                        io_limit,
+                                        "Pre-depth",
+                                    );
                                     // Zoom step: extract center children
                                     let new_tl = get_child_fn(
                                         &mut arena,
@@ -3965,7 +4064,16 @@ fn main() {
                                         4,
                                         &sels,
                                         &mut child_cache,
-                                        eval_fuel,
+                                        child_eval_fuel,
+                                    );
+                                    maybe_gc_zoom(
+                                        &mut arena,
+                                        &sels,
+                                        [zoom_tl, zoom_tr, zoom_bl, zoom_br],
+                                        &mut child_cache,
+                                        &mut bool_cache,
+                                        io_limit,
+                                        "Mid-depth",
                                     );
                                     let new_tr = get_child_fn(
                                         &mut arena,
@@ -3973,7 +4081,7 @@ fn main() {
                                         3,
                                         &sels,
                                         &mut child_cache,
-                                        eval_fuel,
+                                        child_eval_fuel,
                                     );
                                     let new_bl = get_child_fn(
                                         &mut arena,
@@ -3981,7 +4089,7 @@ fn main() {
                                         2,
                                         &sels,
                                         &mut child_cache,
-                                        eval_fuel,
+                                        child_eval_fuel,
                                     );
                                     let new_br = get_child_fn(
                                         &mut arena,
@@ -3989,7 +4097,7 @@ fn main() {
                                         1,
                                         &sels,
                                         &mut child_cache,
-                                        eval_fuel,
+                                        child_eval_fuel,
                                     );
                                     zoom_tl = new_tl;
                                     zoom_tr = new_tr;
@@ -4005,80 +4113,112 @@ fn main() {
                                     // GC after zoom step (before probe/render) — clears intermediate garbage
                                     child_cache.clear();
                                     bool_cache.clear();
-                                    {
-                                        let mut roots: Vec<u32> = Vec::new();
-                                        for &s in &sels {
-                                            roots.push(s);
-                                        }
-                                        roots.extend_from_slice(&[
-                                            zoom_tl, zoom_tr, zoom_bl, zoom_br,
-                                        ]);
-                                        let (total, live, freed) = arena.gc(&roots);
-                                        eprintln!("    Post-zoom GC: total={}, live={}, freed={}, free={}",
-                                            total, live, freed, arena.free_list.len());
-                                    }
+                                    gc_zoom_roots(
+                                        &mut arena,
+                                        &sels,
+                                        [zoom_tl, zoom_tr, zoom_bl, zoom_br],
+                                        &mut child_cache,
+                                        &mut bool_cache,
+                                        "Post-zoom",
+                                    );
 
                                     // Probe bool_b
+                                    maybe_gc_zoom(
+                                        &mut arena,
+                                        &sels,
+                                        [zoom_tl, zoom_tr, zoom_bl, zoom_br],
+                                        &mut child_cache,
+                                        &mut bool_cache,
+                                        io_limit,
+                                        "Pre-probe",
+                                    );
                                     let b_tl = get_bool_fn(
                                         &mut arena,
                                         zoom_tl,
                                         &sels,
                                         &mut bool_cache,
-                                        eval_fuel,
+                                        probe_bool_eval_fuel,
+                                    );
+                                    maybe_gc_zoom(
+                                        &mut arena,
+                                        &sels,
+                                        [zoom_tl, zoom_tr, zoom_bl, zoom_br],
+                                        &mut child_cache,
+                                        &mut bool_cache,
+                                        io_limit,
+                                        "Mid-probe-1",
                                     );
                                     let b_tr = get_bool_fn(
                                         &mut arena,
                                         zoom_tr,
                                         &sels,
                                         &mut bool_cache,
-                                        eval_fuel,
+                                        probe_bool_eval_fuel,
+                                    );
+                                    maybe_gc_zoom(
+                                        &mut arena,
+                                        &sels,
+                                        [zoom_tl, zoom_tr, zoom_bl, zoom_br],
+                                        &mut child_cache,
+                                        &mut bool_cache,
+                                        io_limit,
+                                        "Mid-probe-2",
                                     );
                                     let b_bl = get_bool_fn(
                                         &mut arena,
                                         zoom_bl,
                                         &sels,
                                         &mut bool_cache,
-                                        eval_fuel,
+                                        probe_bool_eval_fuel,
+                                    );
+                                    maybe_gc_zoom(
+                                        &mut arena,
+                                        &sels,
+                                        [zoom_tl, zoom_tr, zoom_bl, zoom_br],
+                                        &mut child_cache,
+                                        &mut bool_cache,
+                                        io_limit,
+                                        "Mid-probe-3",
                                     );
                                     let b_br = get_bool_fn(
                                         &mut arena,
                                         zoom_br,
                                         &sels,
                                         &mut bool_cache,
-                                        eval_fuel,
+                                        probe_bool_eval_fuel,
                                     );
                                     eprintln!("  Depth {} probe: TL={:?} TR={:?} BL={:?} BR={:?} arena={} free={}",
                                         depth, b_tl, b_tr, b_bl, b_br, arena.nodes.len(), arena.free_list.len());
 
                                     // GC after probe, before render
-                                    {
-                                        let mut roots: Vec<u32> = Vec::new();
-                                        for &s in &sels {
-                                            roots.push(s);
-                                        }
-                                        roots.extend_from_slice(&[
-                                            zoom_tl, zoom_tr, zoom_bl, zoom_br,
-                                        ]);
-                                        let (total, live, freed) = arena.gc(&roots);
-                                        eprintln!("    Pre-render GC: total={}, live={}, freed={}, free={}",
-                                            total, live, freed, arena.free_list.len());
-                                    }
+                                    gc_zoom_roots(
+                                        &mut arena,
+                                        &sels,
+                                        [zoom_tl, zoom_tr, zoom_bl, zoom_br],
+                                        &mut child_cache,
+                                        &mut bool_cache,
+                                        "Pre-render",
+                                    );
 
-                                    // Render using shared lazy evaluation
-                                    // NOTE: `data` is NOT in gc_extra_roots — only zoom subtree is kept alive
+                                    // Render using shared lazy evaluation.
+                                    // Keep only zoom subtree + selectors as live roots for GC.
                                     let render_sz: usize = 8;
+                                    let render_gc_min_free = calc_gc_min_free(&arena, io_limit);
                                     eprintln!(
-                                        "  Rendering depth {} ({}x{} center zoom)...",
-                                        depth, render_sz, render_sz
+                                        "  Rendering depth {} ({}x{} center zoom, fuel={}, gc_min_free={})...",
+                                        depth,
+                                        render_sz,
+                                        render_sz,
+                                        render_eval_fuel,
+                                        render_gc_min_free
                                     );
                                     let pix = render_shared(
                                         &mut arena,
                                         [zoom_tl, zoom_tr, zoom_bl, zoom_br],
                                         render_sz,
                                         &sels,
-                                        eval_fuel,
-                                        &[zoom_tl, zoom_tr, zoom_bl, zoom_br],
-                                        1_000_000_000,
+                                        render_eval_fuel,
+                                        render_gc_min_free,
                                     );
                                     let bc = pix.iter().filter(|&&p| p == 0).count();
                                     let wc = pix.iter().filter(|&&p| p == 255).count();
@@ -4100,18 +4240,14 @@ fn main() {
                                     // GC after each depth — only zoom roots, NO `data`
                                     child_cache.clear();
                                     bool_cache.clear();
-                                    {
-                                        let mut roots: Vec<u32> = Vec::new();
-                                        for &s in &sels {
-                                            roots.push(s);
-                                        }
-                                        roots.extend_from_slice(&[
-                                            zoom_tl, zoom_tr, zoom_bl, zoom_br,
-                                        ]);
-                                        let (total, live, freed) = arena.gc(&roots);
-                                        eprintln!("    Post-depth GC: total={}, live={}, freed={}, free={}",
-                                            total, live, freed, arena.free_list.len());
-                                    }
+                                    gc_zoom_roots(
+                                        &mut arena,
+                                        &sels,
+                                        [zoom_tl, zoom_tr, zoom_bl, zoom_br],
+                                        &mut child_cache,
+                                        &mut bool_cache,
+                                        "Post-depth",
+                                    );
                                 }
                             }
                             _ => {
@@ -4295,7 +4431,7 @@ fn main() {
                         total_steps += test_fuel - fd;
 
                         // Step E: Decode p1 as Church number
-                        let mut fe = test_fuel;
+                        let fe = test_fuel;
                         let p1_val = decode_church_num(&mut arena, p1_r, fe);
                         // Note: decode_church_num uses its own fuel internally
 
@@ -4419,38 +4555,6 @@ fn main() {
             eprintln!("Unknown decode mode: {}", decode_mode);
         }
     }
-}
-
-/// Build Church numeral in arena: Church n = succ^n(zero)
-/// where succ = S(S(KS)K), zero = KI
-fn make_church_num(arena: &mut Arena, n: u64) -> u32 {
-    // zero = KI
-    let ki = make_false(arena);
-    if n == 0 {
-        return ki;
-    }
-    // succ = S(S(KS)K)
-    let k = arena.alloc(K, NIL, NIL);
-    let s = arena.alloc(S, NIL, NIL);
-    let ks = arena.alloc(APP, k.clone(), s.clone());
-    let s2 = arena.alloc(S, NIL, NIL);
-    let s_ks = arena.alloc(APP, s2, ks);
-    let k2 = arena.alloc(K, NIL, NIL);
-    let succ = arena.alloc(APP, s_ks, k2);
-
-    let mut result = ki;
-    for _ in 0..n {
-        // Need fresh succ each time since lazy eval shares nodes
-        let k = arena.alloc(K, NIL, NIL);
-        let s = arena.alloc(S, NIL, NIL);
-        let ks = arena.alloc(APP, k, s);
-        let s2 = arena.alloc(S, NIL, NIL);
-        let s_ks = arena.alloc(APP, s2, ks);
-        let k2 = arena.alloc(K, NIL, NIL);
-        let succ = arena.alloc(APP, s_ks, k2);
-        result = arena.alloc(APP, succ, result);
-    }
-    result
 }
 
 /// Build Scott-encoded number in arena.
@@ -4714,7 +4818,7 @@ fn decode_integer(arena: &mut Arena, node: u32, fuel: u64) -> Option<i64> {
     // The last bit IS the sign bit.
 
     // Interpretation: bits = [LSB, ..., MSB/sign]
-    let sign = bits[bits.len() - 1];
+    // let sign = bits[bits.len() - 1];
     let mut n: i64 = 0;
     for (i, &b) in bits.iter().enumerate() {
         if i == bits.len() - 1 {
@@ -4807,420 +4911,6 @@ fn decode_string(arena: &mut Arena, node: u32, fuel: u64) -> Option<String> {
     // outermost gives 'c', then 'b', then 'a'. So we need to reverse.
     chars.reverse();
     Some(chars.into_iter().collect())
-}
-
-/// Render image quadtree.
-/// Image node: (tuple bool_b NW NE SW SE) = λp. p(b)(NW)(NE)(SW)(SE)
-/// This is a 1-arg pair with 5 data fields.
-/// To extract field i, we pass a selector function.
-fn render_image_quadtree(
-    arena: &mut Arena,
-    node: u32,
-    pixels: &mut [u8],
-    x: usize,
-    y: usize,
-    size: usize,
-    img_width: usize,
-    fuel: &mut u64,
-    count: &mut u64,
-) {
-    if *fuel == 0 || size == 0 {
-        return;
-    }
-
-    // Check if it's a simple boolean (uniform color)
-    let is_bool = decode_bool(arena, node, (*fuel).min(200000));
-    match is_bool {
-        Some(false) => {
-            fill_rect(pixels, x, y, size, 255, img_width); // false = white
-            *count += (size * size) as u64;
-            return;
-        }
-        Some(true) => {
-            fill_rect(pixels, x, y, size, 0, img_width); // true = black
-            *count += (size * size) as u64;
-            return;
-        }
-        None => {}
-    }
-
-    // Extract the 5 fields of the image tuple:
-    // node(sel) = sel(b)(NW)(NE)(SW)(SE)
-    // To get b: sel = λa b c d e. a = K(K(K(K)))? No, need proper selectors.
-    // Easier approach: build selector for each field.
-    //
-    // sel_0 = λa b c d e. a — returns 1st arg
-    // For 5 args, sel_0(a)(b)(c)(d)(e) = a
-    // We can build: sel_0 = K applied strategically, but it's complex.
-    //
-    // Simpler: use 1-arg extraction successively.
-    // node(handler) = handler(b)(NW)(NE)(SW)(SE)
-    // If handler = K: K(b)(NW) = b. Then b(NE)(SW)(SE) — oops, extra args.
-    //
-    // Better: build actual selector combinators.
-    // sel0(a)(b)(c)(d)(e) = a: need to discard b,c,d,e
-    //   = λa.λb.λc.λd.λe. a
-    //   In SKI: K(K(K(K))) doesn't work simply.
-    //   Let's build: λa. K(K(K(a)))
-    //   K(K(K(a)))(b) = K(K(a)), (c) = K(a), (d) = a, ... wait needs 5 total.
-    //
-    // Actually for 5 args:
-    //   sel0 = λa b c d e. a
-    //   = λa. λb. K a ... no:
-    //   λe. a = K a (since e not free in a)
-    //   λd. K a = K(K a) (since d not free)
-    //   λc. K(K a) = K(K(K a)) (since c not free)
-    //   λb. K(K(K a)) = K(K(K(K a))) ... wait that's too many K's.
-    //   λa. K(K(K(K a))) — but 'a' IS free here!
-    //   bracket[a](K(K(K(K a)))) = S(bracket[a](K(K(K(K)))))(bracket[a](a))
-    //     = S(K(K(K(K(K)))))(I)
-    //
-    // So sel0 = S(K(K(K(K(K)))))(I)? Let me verify:
-    // sel0(a) = K(K(K(K(K))))(a)(I(a)) = K(K(K(K)))(I(a)) = K(K(K(K)))(a)
-    // Hmm that's not right. Let me just build them programmatically.
-
-    // Build selector for 5-tuple field i (0-indexed):
-    // sel_i(x0)(x1)(x2)(x3)(x4) = x_i
-    // Implementation: apply node to a handler that captures the right field.
-
-    // For extracting field 0 (bool b):
-    // We need: handler(b)(NW)(NE)(SW)(SE) = b
-    // handler = λa b c d e. a
-    // Build as: a function that takes 5 args and returns the first.
-    // We can use K chains: need to absorb 4 extra args after the first.
-    // handler(a) should return λb c d e. a = K(K(K(a)))
-    // So handler = λa. K(K(K(a))) = B(B(B(K)))(K)(K) ... complex in SKI.
-    //
-    // Alternatively, just evaluate in multiple steps:
-    // Step 1: node(marker) to see what the marker receives
-    // But marker(b)(NW)(NE)(SW)(SE) = APP chain, not reduced.
-    //
-    // Best approach: build lambda-style selectors in the arena.
-
-    // Build selector: takes 5 args, returns the one at position `pos`.
-    fn build_sel5(arena: &mut Arena, pos: usize) -> u32 {
-        // λx0 x1 x2 x3 x4. x_pos
-        // We build this as nested K / I combinators.
-        // For each argument after pos: wrap in K
-        // For pos itself: identity
-        // For arguments before pos: wrap in K(K(...))
-        //
-        // Alternative: just build 5 unique markers, create the applications,
-        // and pick out the right one.
-        // Actually the simplest correct approach:
-        // Use the S/K/I encoding of λx0.λx1.λx2.λx3.λx4. x_{pos}
-
-        // For pos=0: λa b c d e. a
-        // After abstracting e from a: K a
-        // After abstracting d from K a: K(K a)
-        // After abstracting c: K(K(K a))
-        // After abstracting b: K(K(K(K a)))
-        // After abstracting a from K(K(K(K a))):
-        //   bracket[a](K(K(K(K(a))))) = S (K(K(K(K(K))))) I
-        //   because K(K(K(K(a)))) = K(K(K(K))) applied to a... wait no.
-        //   K(K(K(K(a)))) = APP(K, APP(K, APP(K, APP(K, a))))
-        //   bracket[a] of this:
-        //     = S(bracket[a](K))(bracket[a](APP(K, APP(K, APP(K, a)))))
-        //     This gets recursive and complex.
-        //
-        // Let me just hardcode the selectors. They're small.
-
-        match pos {
-            0 => {
-                // λa b c d e. a
-                // = λa. K(K(K(K(a))))
-                // More precisely, let me build it step by step.
-                // Start with inner: x (a variable, let's use a marker)
-                // λe.x = K x
-                // λd.(K x) = K (K x)
-                // λc.K(K x) = K(K(K x))
-                // λb.K(K(K x)) = K(K(K(K x)))
-                // λa.K(K(K(K a))) -- now 'a' is free:
-                //   = S (K (K (K (K K)))) I ... nope, need actual computation.
-                //
-                // Let me try a different approach: just build APP chains.
-                // node(sel0) where sel0 takes 5 args and returns first.
-                // I'll use: sel0 = λa.λb.λc.λd.λe. a
-                // In SKI: I need to find the right combinator.
-                // Actually, it's easiest to just evaluate node applied to
-                // (λb c d e. x) for a fresh x, but we can't build lambdas directly.
-                //
-                // Simplest practical approach: use nested evaluation.
-                // Apply node to 5 markers, evaluate, pick out which marker appears.
-                // Then for extracting the actual value, we use a cleverer trick:
-                //
-                // Apply node to (λb c d e. RESULT) where RESULT is a side-channel.
-                // In SKI: we need handler(a) = K(K(K(K(a))))
-                //   = a needs to survive 4 more applications.
-                //
-                // K(K(K(K(a))))(b) = K(K(K(a)))
-                // K(K(K(a)))(c) = K(K(a))
-                // K(K(a))(d) = K(a)
-                // K(a)(e) = a  ✓
-                //
-                // So handler = λa. K(K(K(K(a))))
-                // = (B K (B K (B K K))) where B = S(KS)K
-                // Or more simply: compose K four times.
-                //
-                // Let me build K∘K∘K∘K in the arena:
-                // f(x) = K(K(K(K(x))))
-                // f = B(K, B(K, B(K, K))) where B(f,g)(x) = f(g(x))
-                // B = S(KS)K
-                //
-                // Or: f = S(K(S(K(S(K(KK))))))(I) ... too complex.
-                //
-                // Practical: build a node that when applied gives K(K(K(K(a)))).
-                // node(handler)(rest...) → handler(a)(rest...)
-                // So if we make handler that when given a, returns K^4(a):
-                // We need: handler(a)(b)(c)(d)(e) = a
-                //
-                // Construct handler as: S(K(K))(S(K(K))(S(K(K))(K)))
-                // Hmm I'm overcomplicating this. Let me just use an iterative approach.
-
-                // Build: λx. K(K(K(K(x))))
-                // = S(K(K(K(K(K)))))(I) ... let me verify:
-                // S(K(K(K(K(K)))))(I)(x) = K(K(K(K(K))))(x)(I(x)) = K(K(K(K)))(x) ... no.
-
-                // Actually, I think the cleanest approach is to use the arena to
-                // build the combinator via repeated composition.
-                // K4(x) = K(K(K(K(x))))
-                // This is (K ∘ K ∘ K ∘ K)(x)
-                // In SKI: compose f g = S(Kf)g (= B f g where B = S(KS)K)
-                // But that's for B(f)(g)(x) = f(g(x)).
-                //
-                // K4 = B(K, B(K, B(K, K)))
-                // B(K, K)(x) = K(K(x)) = K∘K
-                // B(K, B(K, K))(x) = K(K(K(x))) = K∘K∘K
-                // B(K, B(K, B(K, K)))(x) = K(K(K(K(x)))) = K∘K∘K∘K ✓
-                //
-                // B(f, g) = S(Kf)(g)
-
-                // B(K, K):
-                let _k = arena.alloc(K, NIL, NIL);
-                let s = arena.alloc(S, NIL, NIL);
-                let k1a = arena.alloc(K, NIL, NIL);
-                let k1b = arena.alloc(K, NIL, NIL);
-                let kk_inner = arena.alloc(APP, k1a, k1b); // K(K)
-                let s_kk = arena.alloc(APP, s, kk_inner);
-                let k1c = arena.alloc(K, NIL, NIL);
-                let bkk = arena.alloc(APP, s_kk, k1c);
-                // B(K, K) = S(K(K))(K)
-
-                // B(K, B(K, K)):
-                let s2 = arena.alloc(S, NIL, NIL);
-                let k2a = arena.alloc(K, NIL, NIL);
-                let k2b = arena.alloc(K, NIL, NIL);
-                let kk2 = arena.alloc(APP, k2a, k2b);
-                let s2_kk2 = arena.alloc(APP, s2, kk2);
-                let bk_bkk = arena.alloc(APP, s2_kk2, bkk);
-
-                // B(K, B(K, B(K, K))):
-                let s3 = arena.alloc(S, NIL, NIL);
-                let k3a = arena.alloc(K, NIL, NIL);
-                let k3b = arena.alloc(K, NIL, NIL);
-                let kk3 = arena.alloc(APP, k3a, k3b);
-                let s3_kk3 = arena.alloc(APP, s3, kk3);
-                arena.alloc(APP, s3_kk3, bk_bkk)
-            }
-            _ => {
-                // For other positions, we need different selectors.
-                // pos=1: λa b c d e. b = K(λb c d e. b) ... hmm, we want to skip a.
-                // Actually: apply K to sel0_of_4 (which selects first of 4 args).
-                // sel1 = K(sel0_of_4) where sel0_of_4 = B(K, B(K, K)) (select first of 4)
-                //
-                // For simplicity, let me build it for each case.
-                // pos=1: λa b. K(K(K(b))) applied as K(B(K, B(K, K)))
-                // pos=2: λa b c. K(K(c)) applied as K(K(B(K, K)))
-                // pos=3: λa b c d. K(d) applied as K(K(K(K)))
-                // pos=4: λa b c d e. e applied as K(K(K(K(I)))) ... = K(K(K(KI)))
-
-                // Hmm this is getting complicated. Let me use a simpler runtime approach.
-                // I'll just apply the node to 5 fresh variable nodes and
-                // evaluate, then extract the right one by position.
-                // This doesn't work because the variables get applied to each other.
-                //
-                // Better approach: Use a sequence of pair1_fst / pair1_snd like operations
-                // but adapted for 5-tuples.
-                //
-                // tuple5(a,b,c,d,e)(K) = K(a)(b)(c)(d)(e) = a(c)(d)(e) — polluted
-                //
-                // For image rendering, I actually don't need individual selectors.
-                // I can use a single handler that captures all 5 values:
-                // node(λa b c d e. marker(a)(b)(c)(d)(e))
-                // But I can't build lambdas in the arena easily.
-                //
-                // SIMPLEST APPROACH: Apply node to a function that stores all 5 values.
-                // Actually, let me just recursively extract using pair-like operations.
-                //
-                // tuple5(a,b,c,d,e)(K) = K(a)(b)(c)(d)(e) = a (with extra args b,c,d,e polluting)
-                // This doesn't work cleanly.
-                //
-                // Let me use the proper selector approach.
-
-                // For pos=1-4, I'll build K^(pos) composed with the (5-pos-1)-absorber.
-                // sel_i = K^i ∘ absorb_{4-i}
-                // where absorb_n(x)(y1)...(yn) = x
-
-                // absorb_0 = I (identity)
-                // absorb_1 = K
-                // absorb_2 = K∘K = B(K,K)
-                // absorb_3 = K∘K∘K = B(K,B(K,K))
-
-                // Then sel_i(x0)(x1)...(x4) = K^i(absorb_{4-i})(x0)(x1)...(x4)
-                // K^i(f)(x0)...(x_{i-1}) = f applied with x_{i-1} discarded i times
-                // Hmm, K^i doesn't work that way.
-
-                // Let me think differently.
-                // sel_0(a)(b)(c)(d)(e) = a → need to absorb b,c,d,e after a
-                //   = λa. K(K(K(K(a)))) — absorb 4 after
-                // sel_1(a)(b)(c)(d)(e) = b → skip a, then absorb c,d,e after b
-                //   = K(λb. K(K(K(b)))) = K(absorb_3_selector)
-                // sel_2(a)(b)(c)(d)(e) = c → skip a,b, absorb d,e after c
-                //   = K(K(λc. K(K(c)))) = K(K(absorb_2_selector))
-                // sel_3 = K(K(K(λd. K(d)))) = K(K(K(K)))
-                // sel_4 = K(K(K(K(I)))) = K(K(K(KI)))
-
-                // Let me verify sel_3 = K(K(K(K))):
-                // K(K(K(K)))(a) = K(K(K))
-                // K(K(K))(b) = K(K)
-                // K(K)(c) = K
-                // K(d) = λe.d ... K(d)(e) = d ✓ → sel_3 selects 4th arg (index 3)
-
-                // sel_4 = K(K(K(KI))):
-                // K(K(K(KI)))(a) = K(K(KI))
-                // K(K(KI))(b) = K(KI)
-                // K(KI)(c) = KI
-                // KI(d) = I
-                // I(e) = e ✓ → sel_4 selects 5th arg (index 4)
-
-                // Now sel_1 = K(B(K, B(K, K))):
-                // K(f)(a) = f (skip a)
-                // f(b)(c)(d)(e) should return b
-                // f = absorb_3_selector = B(K, B(K, K)) = λx. K(K(K(x)))
-                // f(b) = K(K(K(b)))
-                // K(K(K(b)))(c) = K(K(b))
-                // K(K(b))(d) = K(b)
-                // K(b)(e) = b ✓
-
-                // sel_2 = K(K(B(K, K))):
-                // K(K(g))(a) = K(g)
-                // K(g)(b) = g
-                // g(c)(d)(e) should return c
-                // g = B(K,K) = λx. K(K(x))
-                // g(c) = K(K(c))
-                // K(K(c))(d) = K(c)
-                // K(c)(e) = c ✓
-
-                match pos {
-                    1 => {
-                        // sel_1 = K(B(K, B(K, K)))
-                        // B(K, K) = S(K(K))(K)
-                        let s1 = arena.alloc(S, NIL, NIL);
-                        let k1a = arena.alloc(K, NIL, NIL);
-                        let k1b = arena.alloc(K, NIL, NIL);
-                        let kk1 = arena.alloc(APP, k1a, k1b);
-                        let s1_kk1 = arena.alloc(APP, s1, kk1);
-                        let k1c = arena.alloc(K, NIL, NIL);
-                        let bkk = arena.alloc(APP, s1_kk1, k1c);
-                        // B(K, B(K,K)) = S(K(K))(B(K,K))
-                        let s2 = arena.alloc(S, NIL, NIL);
-                        let k2a = arena.alloc(K, NIL, NIL);
-                        let k2b = arena.alloc(K, NIL, NIL);
-                        let kk2 = arena.alloc(APP, k2a, k2b);
-                        let s2_kk2 = arena.alloc(APP, s2, kk2);
-                        let bk_bkk = arena.alloc(APP, s2_kk2, bkk);
-                        // K(B(K, B(K,K)))
-                        let k_outer = arena.alloc(K, NIL, NIL);
-                        arena.alloc(APP, k_outer, bk_bkk)
-                    }
-                    2 => {
-                        // sel_2 = K(K(B(K, K)))
-                        // B(K,K) = S(K(K))(K)
-                        let s1 = arena.alloc(S, NIL, NIL);
-                        let k1a = arena.alloc(K, NIL, NIL);
-                        let k1b = arena.alloc(K, NIL, NIL);
-                        let kk1 = arena.alloc(APP, k1a, k1b);
-                        let s1_kk1 = arena.alloc(APP, s1, kk1);
-                        let k1c = arena.alloc(K, NIL, NIL);
-                        let bkk = arena.alloc(APP, s1_kk1, k1c);
-                        // K(B(K,K))
-                        let k1 = arena.alloc(K, NIL, NIL);
-                        let k_bkk = arena.alloc(APP, k1, bkk);
-                        // K(K(B(K,K)))
-                        let k2 = arena.alloc(K, NIL, NIL);
-                        arena.alloc(APP, k2, k_bkk)
-                    }
-                    3 => {
-                        // sel_3 = K(K(K(K)))
-                        let k1 = arena.alloc(K, NIL, NIL);
-                        let k2 = arena.alloc(K, NIL, NIL);
-                        let kk = arena.alloc(APP, k1, k2);
-                        let k3 = arena.alloc(K, NIL, NIL);
-                        let kkk = arena.alloc(APP, k3, kk);
-                        let k4 = arena.alloc(K, NIL, NIL);
-                        arena.alloc(APP, k4, kkk)
-                    }
-                    4 => {
-                        // sel_4 = K(K(K(KI)))
-                        let ki = make_false(arena);
-                        let k1 = arena.alloc(K, NIL, NIL);
-                        let k_ki = arena.alloc(APP, k1, ki);
-                        let k2 = arena.alloc(K, NIL, NIL);
-                        let kk_ki = arena.alloc(APP, k2, k_ki);
-                        let k3 = arena.alloc(K, NIL, NIL);
-                        arena.alloc(APP, k3, kk_ki)
-                    }
-                    _ => unreachable!(),
-                }
-            }
-        }
-    }
-
-    // Extract field at position pos from 5-tuple node.
-    fn extract_tuple5(arena: &mut Arena, node: u32, pos: usize, fuel: &mut u64) -> u32 {
-        let sel = build_sel5(arena, pos);
-        let app = arena.alloc(APP, node, sel);
-        arena.whnf(app, fuel);
-        arena.follow(app)
-    }
-
-    if size <= 1 {
-        // At pixel level: extract bool_b (field 0)
-        let b_val = extract_tuple5(arena, node, 0, fuel);
-        let b = decode_bool(arena, b_val, (*fuel).min(200000));
-        let color = match b {
-            Some(true) => 0u8,    // true = black
-            Some(false) => 255u8, // false = white
-            None => 128u8,        // unknown
-        };
-        if x < img_width && y < img_width {
-            pixels[y * img_width + x] = color;
-        }
-        *count += 1;
-        return;
-    }
-
-    // Extract 4 quadrant children (fields 1-4): NW, NE, SW, SE
-    let nw = extract_tuple5(arena, node, 1, fuel);
-    let ne = extract_tuple5(arena, node, 2, fuel);
-    let sw = extract_tuple5(arena, node, 3, fuel);
-    let se = extract_tuple5(arena, node, 4, fuel);
-
-    let half = size / 2;
-    render_image_quadtree(arena, nw, pixels, x, y, half, img_width, fuel, count);
-    render_image_quadtree(arena, ne, pixels, x + half, y, half, img_width, fuel, count);
-    render_image_quadtree(arena, sw, pixels, x, y + half, half, img_width, fuel, count);
-    render_image_quadtree(
-        arena,
-        se,
-        pixels,
-        x + half,
-        y + half,
-        half,
-        img_width,
-        fuel,
-        count,
-    );
 }
 
 /// Render diamond quadtree to pixel buffer.
@@ -5368,83 +5058,6 @@ fn render_quadtree_v2(
     );
 }
 
-/// Render using pair1 (1-arg Scott pairs) nested:
-/// pair1(cond, pair1(qa, pair1(qb, pair1(qc, qd))))
-fn render_pair1_nested(
-    arena: &mut Arena,
-    node: u32,
-    pixels: &mut [u8],
-    x: usize,
-    y: usize,
-    size: usize,
-    img_width: usize,
-    fuel: &mut u64,
-    count: &mut u64,
-) {
-    if *fuel == 0 || size == 0 {
-        return;
-    }
-
-    let is_bool = decode_bool(arena, node, (*fuel).min(200000));
-    match is_bool {
-        Some(false) => {
-            fill_rect(pixels, x, y, size, 255, img_width);
-            *count += (size * size) as u64;
-            return;
-        }
-        Some(true) => {
-            fill_rect(pixels, x, y, size, 0, img_width);
-            *count += (size * size) as u64;
-            return;
-        }
-        None => {}
-    }
-
-    if size <= 1 {
-        // Extract cond using pair1_fst
-        let cond = pair1_fst(arena, node, fuel);
-        let b = decode_bool(arena, cond, (*fuel).min(200000));
-        let color = match b {
-            Some(true) => 0u8,
-            Some(false) => 255u8,
-            None => 128u8,
-        };
-        if x < img_width && y < img_width {
-            pixels[y * img_width + x] = color;
-        }
-        *count += 1;
-        return;
-    }
-
-    // pair1(cond, rest) → pair1_snd = rest
-    let rest = pair1_snd(arena, node, fuel);
-    // pair1(qa, rest2) → pair1_fst = qa
-    let qa = pair1_fst(arena, rest, fuel);
-    let rest2 = pair1_snd(arena, rest, fuel);
-    // pair1(qb, rest3)
-    let qb = pair1_fst(arena, rest2, fuel);
-    let rest3 = pair1_snd(arena, rest2, fuel);
-    // pair1(qc, qd)
-    let qc = pair1_fst(arena, rest3, fuel);
-    let qd = pair1_snd(arena, rest3, fuel);
-
-    let half = size / 2;
-    render_pair1_nested(arena, qa, pixels, x, y, half, img_width, fuel, count);
-    render_pair1_nested(arena, qb, pixels, x + half, y, half, img_width, fuel, count);
-    render_pair1_nested(arena, qc, pixels, x, y + half, half, img_width, fuel, count);
-    render_pair1_nested(
-        arena,
-        qd,
-        pixels,
-        x + half,
-        y + half,
-        half,
-        img_width,
-        fuel,
-        count,
-    );
-}
-
 /// Build a 5-tuple selector in the arena: sel_i(a)(b)(c)(d)(e) = <i-th arg>
 /// Diamond structure: diamond(COND)(QA)(QB)(QC)(QD) = λf. f(COND)(QA)(QB)(QC)(QD)
 /// So data(sel_i) extracts the i-th field.
@@ -5457,147 +5070,6 @@ fn render_pair1_nested(
 ///   sel_4 = K(K(K(K(I))))
 fn build_diamond_sel(arena: &mut Arena, pos: usize) -> u32 {
     arena.intern_diamond_sel(pos)
-}
-
-/// Render image using diamond (Church-encoded 5-tuple) structure.
-/// diamond(COND)(QA)(QB)(QC)(QD) = λf. f(COND)(QA)(QB)(QC)(QD)
-/// data(sel_i) extracts the i-th field.
-fn render_diamond_church(
-    arena: &mut Arena,
-    node: u32,
-    pixels: &mut [u8],
-    x: usize,
-    y: usize,
-    size: usize,
-    img_width: usize,
-    fuel: &mut u64,
-    count: &mut u64,
-    depth: usize,
-) {
-    if *fuel == 0 || size == 0 {
-        return;
-    }
-    if depth > 20 {
-        return;
-    } // safety limit
-
-    // Check if it's a simple boolean (uniform color leaf)
-    let is_bool = decode_bool(arena, node, (*fuel).min(500000));
-    match is_bool {
-        Some(false) => {
-            fill_rect(pixels, x, y, size, 255, img_width); // false = white
-            *count += (size * size) as u64;
-            return;
-        }
-        Some(true) => {
-            fill_rect(pixels, x, y, size, 0, img_width); // true = black
-            *count += (size * size) as u64;
-            return;
-        }
-        None => {}
-    }
-
-    if size <= 1 {
-        // At pixel level, extract COND
-        let sel0 = build_diamond_sel(arena, 0);
-        let app = arena.alloc(APP, node, sel0);
-        arena.whnf(app, fuel);
-        let cond = arena.follow(app);
-        let b = decode_bool(arena, cond, (*fuel).min(500000));
-        if *count < 8 {
-            eprintln!(
-                "    pixel({},{}) depth={} cond_bool={:?} node_tag={} cond: {}",
-                x,
-                y,
-                depth,
-                b,
-                arena.nodes[arena.follow(node) as usize].tag,
-                &describe(arena, cond, 0)[..100.min(describe(arena, cond, 0).len())]
-            );
-        }
-        let color = match b {
-            Some(true) => 0u8,
-            Some(false) => 255u8,
-            None => 128u8,
-        };
-        if x < img_width && y < img_width {
-            pixels[y * img_width + x] = color;
-        }
-        *count += 1;
-        return;
-    }
-
-    // Extract 4 quadrants using proper selectors
-    let sel1 = build_diamond_sel(arena, 1);
-    let sel2 = build_diamond_sel(arena, 2);
-    let sel3 = build_diamond_sel(arena, 3);
-    let sel4 = build_diamond_sel(arena, 4);
-
-    let app1 = arena.alloc(APP, node, sel1);
-    arena.whnf(app1, fuel);
-    let qa = arena.follow(app1);
-
-    let app2 = arena.alloc(APP, node, sel2);
-    arena.whnf(app2, fuel);
-    let qb = arena.follow(app2);
-
-    let app3 = arena.alloc(APP, node, sel3);
-    arena.whnf(app3, fuel);
-    let qc = arena.follow(app3);
-
-    let app4 = arena.alloc(APP, node, sel4);
-    arena.whnf(app4, fuel);
-    let qd = arena.follow(app4);
-
-    let half = size / 2;
-    render_diamond_church(
-        arena,
-        qa,
-        pixels,
-        x,
-        y,
-        half,
-        img_width,
-        fuel,
-        count,
-        depth + 1,
-    );
-    render_diamond_church(
-        arena,
-        qb,
-        pixels,
-        x + half,
-        y,
-        half,
-        img_width,
-        fuel,
-        count,
-        depth + 1,
-    );
-    render_diamond_church(
-        arena,
-        qc,
-        pixels,
-        x,
-        y + half,
-        half,
-        img_width,
-        fuel,
-        count,
-        depth + 1,
-    );
-    render_diamond_church(
-        arena,
-        qd,
-        pixels,
-        x + half,
-        y + half,
-        half,
-        img_width,
-        fuel,
-        count,
-        depth + 1,
-    );
 }
 
 /// Fill a rectangular region with a color.
