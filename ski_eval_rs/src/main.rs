@@ -31,6 +31,12 @@ struct Arena {
     nodes: Vec<Node>,
     free_list: Vec<u32>,
     gc_roots: Vec<u32>,  // external roots for GC
+    cached_k: Option<u32>,
+    cached_i: Option<u32>,
+    cached_ki: Option<u32>,
+    cached_marker_t: Option<u32>,
+    cached_marker_f: Option<u32>,
+    cached_diamond_sels: [Option<u32>; 5],
     // Checkpoint/restore for per-pixel rendering
     checkpoint: Option<usize>,      // arena length at checkpoint
     saved_nodes: Vec<(u32, Node)>,  // base nodes modified since checkpoint
@@ -42,6 +48,12 @@ impl Arena {
             nodes: Vec::with_capacity(capacity),
             free_list: Vec::new(),
             gc_roots: Vec::new(),
+            cached_k: None,
+            cached_i: None,
+            cached_ki: None,
+            cached_marker_t: None,
+            cached_marker_f: None,
+            cached_diamond_sels: [None; 5],
             checkpoint: None,
             saved_nodes: Vec::new(),
         }
@@ -75,6 +87,114 @@ impl Arena {
                 self.saved_nodes.push((idx, self.nodes[idx as usize]));
             }
         }
+    }
+
+    #[inline]
+    fn keep_root(&mut self, idx: u32) {
+        if !self.gc_roots.contains(&idx) {
+            self.gc_roots.push(idx);
+        }
+    }
+
+    #[inline]
+    fn valid_cached(&self, idx: Option<u32>) -> Option<u32> {
+        match idx {
+            Some(i) if (i as usize) < self.nodes.len() => Some(i),
+            _ => None,
+        }
+    }
+
+    fn intern_k(&mut self) -> u32 {
+        if let Some(idx) = self.valid_cached(self.cached_k) {
+            return idx;
+        }
+        let idx = self.alloc(K, NIL, NIL);
+        if self.checkpoint.is_none() {
+            self.cached_k = Some(idx);
+            self.keep_root(idx);
+        }
+        idx
+    }
+
+    fn intern_i(&mut self) -> u32 {
+        if let Some(idx) = self.valid_cached(self.cached_i) {
+            return idx;
+        }
+        let idx = self.alloc(I, NIL, NIL);
+        if self.checkpoint.is_none() {
+            self.cached_i = Some(idx);
+            self.keep_root(idx);
+        }
+        idx
+    }
+
+    fn intern_ki(&mut self) -> u32 {
+        if let Some(idx) = self.valid_cached(self.cached_ki) {
+            return idx;
+        }
+        let i_node = self.intern_i();
+        let idx = self.alloc(K1, i_node, NIL); // KI
+        if self.checkpoint.is_none() {
+            self.cached_ki = Some(idx);
+            self.keep_root(idx);
+        }
+        idx
+    }
+
+    fn intern_marker_t(&mut self) -> u32 {
+        if let Some(idx) = self.valid_cached(self.cached_marker_t) {
+            return idx;
+        }
+        let idx = self.alloc(100, NIL, NIL);
+        if self.checkpoint.is_none() {
+            self.cached_marker_t = Some(idx);
+            self.keep_root(idx);
+        }
+        idx
+    }
+
+    fn intern_marker_f(&mut self) -> u32 {
+        if let Some(idx) = self.valid_cached(self.cached_marker_f) {
+            return idx;
+        }
+        let idx = self.alloc(101, NIL, NIL);
+        if self.checkpoint.is_none() {
+            self.cached_marker_f = Some(idx);
+            self.keep_root(idx);
+        }
+        idx
+    }
+
+    fn intern_diamond_sel(&mut self, pos: usize) -> u32 {
+        if pos >= 5 {
+            panic!("selector position out of range: {}", pos);
+        }
+        if let Some(idx) = self.valid_cached(self.cached_diamond_sels[pos]) {
+            return idx;
+        }
+
+        // core_4 = I
+        // core_n = S(KK)(core_{n+1})
+        // sel_i = K^i(core_i)
+        let i_node = self.intern_i();
+        let k_node = self.intern_k();
+        let kk = self.alloc(K1, k_node, NIL); // K(K)
+
+        let mut core = i_node;
+        for _ in 0..(4 - pos) {
+            core = self.alloc(S2, kk, core); // S(KK)(core)
+        }
+
+        let mut result = core;
+        for _ in 0..pos {
+            result = self.alloc(K1, result, NIL); // K(result)
+        }
+
+        if self.checkpoint.is_none() {
+            self.cached_diamond_sels[pos] = Some(result);
+            self.keep_root(result);
+        }
+        result
     }
 
     /// Set a checkpoint: record current arena length for later restore
@@ -376,8 +496,8 @@ fn make_pair(arena: &mut Arena, a: u32, b: u32) -> u32 {
 
 /// Decode boolean: apply to two unique markers.
 fn decode_bool(arena: &mut Arena, node: u32, fuel: u64) -> Option<bool> {
-    let marker_t = arena.alloc(100, NIL, NIL);
-    let marker_f = arena.alloc(101, NIL, NIL);
+    let marker_t = arena.intern_marker_t();
+    let marker_f = arena.intern_marker_f();
     let app1 = arena.alloc(APP, node, marker_t);
     let app2 = arena.alloc(APP, app1, marker_f);
     let mut f = fuel;
@@ -3524,9 +3644,9 @@ fn write_pgm(filename: &str, width: usize, height: usize, pixels: &[u8]) {
 /// Extract pair's first element: pair(K)(dummy) → A
 /// 2-arg Scott pair needs TWO arguments to extract.
 fn pair_fst(arena: &mut Arena, node: u32, fuel: &mut u64) -> u32 {
-    let k_sel = arena.alloc(K, NIL, NIL);
+    let k_sel = arena.intern_k();
     let app1 = arena.alloc(APP, node, k_sel);
-    let dummy = arena.alloc(I, NIL, NIL); // dummy second arg (ignored by pair)
+    let dummy = arena.intern_i(); // dummy second arg (ignored by pair)
     let app2 = arena.alloc(APP, app1, dummy);
     arena.whnf(app2, fuel);
     arena.follow(app2)
@@ -3535,9 +3655,9 @@ fn pair_fst(arena: &mut Arena, node: u32, fuel: &mut u64) -> u32 {
 /// Extract pair's second element: pair(KI)(dummy) → B
 /// 2-arg Scott pair needs TWO arguments to extract.
 fn pair_snd(arena: &mut Arena, node: u32, fuel: &mut u64) -> u32 {
-    let ki = make_false(arena);
+    let ki = arena.intern_ki();
     let app1 = arena.alloc(APP, node, ki);
-    let dummy = arena.alloc(I, NIL, NIL); // dummy second arg (ignored by pair)
+    let dummy = arena.intern_i(); // dummy second arg (ignored by pair)
     let app2 = arena.alloc(APP, app1, dummy);
     arena.whnf(app2, fuel);
     arena.follow(app2)
@@ -3546,7 +3666,7 @@ fn pair_snd(arena: &mut Arena, node: u32, fuel: &mut u64) -> u32 {
 /// 1-arg pair extraction: node(K) → first element
 /// For 1-arg Scott pairs: S(SI(KA))(KB)(K) = K(A)(B) = A
 fn pair1_fst(arena: &mut Arena, node: u32, fuel: &mut u64) -> u32 {
-    let k_sel = arena.alloc(K, NIL, NIL);
+    let k_sel = arena.intern_k();
     let app = arena.alloc(APP, node, k_sel);
     arena.whnf(app, fuel);
     arena.follow(app)
@@ -3555,7 +3675,7 @@ fn pair1_fst(arena: &mut Arena, node: u32, fuel: &mut u64) -> u32 {
 /// 1-arg pair extraction: node(KI) → second element
 /// For 1-arg Scott pairs: S(SI(KA))(KB)(KI) = KI(A)(B) = B
 fn pair1_snd(arena: &mut Arena, node: u32, fuel: &mut u64) -> u32 {
-    let ki = make_false(arena);
+    let ki = arena.intern_ki();
     let app = arena.alloc(APP, node, ki);
     arena.whnf(app, fuel);
     arena.follow(app)
@@ -4345,36 +4465,7 @@ fn render_pair1_nested(
 ///   sel_3 = K(K(K(S(KK)(I))))
 ///   sel_4 = K(K(K(K(I))))
 fn build_diamond_sel(arena: &mut Arena, pos: usize) -> u32 {
-    // Build the "core" for position pos:
-    // core_4 = I
-    // core_3 = S(KK)(I)
-    // core_2 = S(KK)(S(KK)(I))
-    // core_1 = S(KK)(S(KK)(S(KK)(I)))
-    // core_0 = S(KK)(S(KK)(S(KK)(S(KK)(I))))
-    //
-    // sel_i = K^i(core_i)  (i layers of K wrapping)
-
-    let i_node = arena.alloc(I, NIL, NIL);
-    let k_node = arena.alloc(K, NIL, NIL);
-    let s_node = arena.alloc(S, NIL, NIL);
-
-    // Build KK
-    let kk = arena.alloc(K1, k_node, NIL); // K applied to K
-
-    // Build the core: S(KK) applied (4-pos) times to I
-    let mut core = i_node;
-    for _ in 0..(4 - pos) {
-        // S(KK)(core) = S2(KK, core)
-        let s1 = arena.alloc(S1, kk, NIL); // S applied to KK
-        core = arena.alloc(S2, kk, core);   // S(KK)(core)
-    }
-
-    // Wrap in K layers: K^pos(core)
-    let mut result = core;
-    for _ in 0..pos {
-        result = arena.alloc(K1, result, NIL); // K(result)
-    }
-    result
+    arena.intern_diamond_sel(pos)
 }
 
 /// Render image using diamond (Church-encoded 5-tuple) structure.
