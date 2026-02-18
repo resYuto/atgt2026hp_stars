@@ -53,7 +53,12 @@
       "Bash(node scripts/query_tokens.js:*)",
       "Bash(node scripts/navigator_query.js:*)",
       "Bash(/c/Python313/python:*)",
-      "Bash(tasklist:*)"
+      "Bash(tasklist:*)",
+      "Bash(sort:*)",
+      "Bash(wmic OS get:*)",
+      "Bash(systeminfo:*)",
+      "Bash(awk:*)",
+      "Bash(git commit:*)"
     ]
   }
 }

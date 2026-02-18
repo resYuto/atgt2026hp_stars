@@ -57,8 +57,8 @@ impl Arena {
                 return idx;
             }
         }
-        // Arena size limit: 500M nodes (~6GB) to prevent OOM
-        if self.nodes.len() >= 500_000_000 {
+        // Arena size limit: 1.9B nodes (~22.8GB) — push memory to the max
+        if self.nodes.len() >= 1_900_000_000 {
             eprintln!("ARENA LIMIT: {} nodes reached, aborting", self.nodes.len());
             std::process::exit(1);
         }
@@ -2822,7 +2822,7 @@ fn main() {
                                 use std::collections::HashMap;
                                 let mut child_cache: HashMap<u32, [u32; 4]> = HashMap::new();
                                 let mut bool_cache: HashMap<u32, Option<bool>> = HashMap::new();
-                                let eval_fuel: u64 = 50_000_000;
+                                let eval_fuel: u64 = 500_000_000;
 
                                 // Helper: extract i-th child (1=TL, 2=TR, 3=BL, 4=BR)
                                 fn get_child_fn(arena: &mut Arena, parent: u32, child_idx: usize,
@@ -2875,17 +2875,19 @@ fn main() {
                                 // For each pixel, navigate from sub_roots to the leaf, extract bool_b,
                                 // then restore arena to discard all temporary nodes.
                                 // This bounds memory usage to: base arena + per-pixel temporaries.
-                                fn render_with_checkpoint(
+                                // Shared lazy evaluation renderer: no checkpoint/restore.
+                                // Benefits from graph sharing - once a node is evaluated, it stays.
+                                // Uses periodic GC to bound memory.
+                                fn render_shared(
                                     arena: &mut Arena,
                                     sub_roots: [u32; 4], // [TL, TR, BL, BR]
                                     size: usize,          // output image size (must be power of 2, >= 2)
                                     sels: &[u32; 5],
                                     fuel_per_pixel: u64,
+                                    gc_extra_roots: &[u32],
+                                    gc_threshold: usize,
                                 ) -> Vec<u8> {
                                     let half = size / 2;
-                                    // Number of levels to descend from each sub_root
-                                    // size=2 -> 0 levels (just read sub_root bool_b)
-                                    // size=4 -> 1 level, size=8 -> 2, size=16 -> 3, etc.
                                     let depth_within = if half <= 1 { 0 } else {
                                         (half as f64).log2() as usize
                                     };
@@ -2896,13 +2898,10 @@ fn main() {
 
                                     for row in 0..size {
                                         for col in 0..size {
-                                            arena.set_checkpoint();
-
-                                            // Determine starting quadrant
                                             let qi = if row < half {
-                                                if col < half { 0 } else { 1 } // TL or TR
+                                                if col < half { 0 } else { 1 }
                                             } else {
-                                                if col < half { 2 } else { 3 } // BL or BR
+                                                if col < half { 2 } else { 3 }
                                             };
                                             let mut node = sub_roots[qi];
                                             let mut local_row = if row < half { row } else { row - half };
@@ -2910,44 +2909,38 @@ fn main() {
                                             let mut local_size = half;
 
                                             let mut ok = true;
-                                            // Navigate to leaf
                                             for _level in 0..depth_within {
                                                 let lh = local_size / 2;
                                                 let child_idx = if local_row < lh {
-                                                    if local_col < lh { 1 } else { 2 } // TL or TR
+                                                    if local_col < lh { 1 } else { 2 }
                                                 } else {
-                                                    if local_col < lh { 3 } else { 4 } // BL or BR
+                                                    if local_col < lh { 3 } else { 4 }
                                                 };
-
-                                                // Apply selector to get child
                                                 let app = arena.alloc(APP, node, sels[child_idx]);
                                                 let mut f = fuel_per_pixel;
                                                 arena.whnf(app, &mut f);
-                                                if f == 0 {
-                                                    ok = false;
-                                                    break;
-                                                }
+                                                if f == 0 { ok = false; break; }
                                                 node = arena.follow(app);
-
                                                 if local_row >= lh { local_row -= lh; }
                                                 if local_col >= lh { local_col -= lh; }
                                                 local_size = lh;
                                             }
 
-                                            // Extract bool_b
                                             let pixel_val = if ok {
                                                 let app = arena.alloc(APP, node, sels[0]);
                                                 let mut f = fuel_per_pixel;
                                                 arena.whnf(app, &mut f);
-                                                let cond = arena.follow(app);
-                                                match decode_bool(arena, cond, 5_000_000) {
-                                                    Some(true) => 255u8,
-                                                    Some(false) => 0u8,
-                                                    None => 128u8,
+                                                if f == 0 {
+                                                    128u8 // fuel exhausted
+                                                } else {
+                                                    let cond = arena.follow(app);
+                                                    match decode_bool(arena, cond, fuel_per_pixel) {
+                                                        Some(true) => 255u8,
+                                                        Some(false) => 0u8,
+                                                        None => 128u8,
+                                                    }
                                                 }
-                                            } else {
-                                                128u8
-                                            };
+                                            } else { 128u8 };
 
                                             pixels[row * size + col] = pixel_val;
                                             match pixel_val {
@@ -2955,11 +2948,19 @@ fn main() {
                                                 0 => black += 1,
                                                 _ => gray += 1,
                                             }
-                                            arena.restore_checkpoint();
                                         }
-                                        if (row + 1) % 4 == 0 || row == size - 1 {
-                                            eprintln!("      Row {}/{}: B={} W={} G={} arena={}",
-                                                row + 1, size, black, white, gray, arena.nodes.len());
+                                        if (row + 1) % 8 == 0 || row == size - 1 {
+                                            eprintln!("      Row {}/{}: B={} W={} G={} arena={} free={}",
+                                                row + 1, size, black, white, gray, arena.nodes.len(), arena.free_list.len());
+                                        }
+                                        // GC when free list runs low (every row check)
+                                        if arena.free_list.len() < 10_000_000 {
+                                            let mut roots: Vec<u32> = Vec::new();
+                                            for &s in sels { roots.push(s); }
+                                            for &r in &sub_roots { roots.push(r); }
+                                            roots.extend_from_slice(gc_extra_roots);
+                                            let (total, live, freed) = arena.gc(&roots);
+                                            eprintln!("      GC: total={}, live={}, freed={}, free={}", total, live, freed, arena.free_list.len());
                                         }
                                     }
                                     pixels
@@ -2997,41 +2998,8 @@ fn main() {
                                 do_gc(&mut arena, &sels, &[data, root_tl, root_tr, root_bl, root_br],
                                     &mut child_cache, &mut bool_cache);
 
-                                // Phase 1: Render depths 1-8 at 2^(depth-1) resolution
-                                // Depth 1 = root bool_b only (1x1)
-                                eprintln!("  Phase 1: Rendering depths 1-8...");
-                                for depth in 1..=8 {
-                                    let sz = 1usize << (depth - 1); // 1, 2, 4, 8, 16, 32, 64, 128
-                                    if sz <= 1 {
-                                        // depth 1: just check root bool_b
-                                        let b = get_bool_fn(&mut arena, data, &sels, &mut bool_cache, eval_fuel);
-                                        let pixel = match b { Some(true) => 255u8, Some(false) => 0u8, _ => 128u8 };
-                                        let fname = format!("{}_depth{}_{}x{}.pgm", img_path, depth, sz, sz);
-                                        write_pgm(&fname, 1, 1, &[pixel]);
-                                        eprintln!("    Depth {} (1x1): {:?} arena={}", depth, b, arena.nodes.len());
-                                    } else {
-                                        eprintln!("    Rendering depth {} ({}x{})... arena={}", depth, sz, sz, arena.nodes.len());
-                                        let pix = render_with_checkpoint(
-                                            &mut arena,
-                                            [root_tl, root_tr, root_bl, root_br],
-                                            sz, &sels, eval_fuel
-                                        );
-                                        let bc = pix.iter().filter(|&&p| p == 0).count();
-                                        let wc = pix.iter().filter(|&&p| p == 255).count();
-                                        let gc = pix.iter().filter(|&&p| p == 128).count();
-                                        eprintln!("      black={}, white={}, gray={}, arena={}", bc, wc, gc, arena.nodes.len());
-                                        let fname = format!("{}_depth{}_{}x{}.pgm", img_path, depth, sz, sz);
-                                        write_pgm(&fname, sz, sz, &pix);
-                                        eprintln!("      Saved: {}", fname);
-                                    }
-
-                                    // GC after each depth to reclaim intermediates
-                                    if arena.nodes.len() > 100_000_000 && arena.free_list.len() < 50_000_000 {
-                                        do_gc(&mut arena, &sels,
-                                            &[data, root_tl, root_tr, root_bl, root_br],
-                                            &mut child_cache, &mut bool_cache);
-                                    }
-                                }
+                                // Phase 1: SKIPPED (all depths 1-8 are all-black)
+                                eprintln!("  Phase 1: SKIPPED (depths 1-8 are all-black)");
 
                                 // Phase 2: Center zoom for depths 9-25
                                 eprintln!("  Phase 2: Center zoom depths 9-25...");
@@ -3041,38 +3009,82 @@ fn main() {
                                 let mut zoom_br = root_br;
 
                                 // Do zoom steps 1-8 first (without rendering, just navigate to center)
-                                for _step in 1..=7 {
+                                for step in 1..=7 {
                                     let new_tl = get_child_fn(&mut arena, zoom_tl, 4, &sels, &mut child_cache, eval_fuel);
                                     let new_tr = get_child_fn(&mut arena, zoom_tr, 3, &sels, &mut child_cache, eval_fuel);
                                     let new_bl = get_child_fn(&mut arena, zoom_bl, 2, &sels, &mut child_cache, eval_fuel);
                                     let new_br = get_child_fn(&mut arena, zoom_br, 1, &sels, &mut child_cache, eval_fuel);
                                     zoom_tl = new_tl; zoom_tr = new_tr; zoom_bl = new_bl; zoom_br = new_br;
+                                    eprintln!("    Zoom step {}: arena={} free={}", step, arena.nodes.len(), arena.free_list.len());
+                                }
+
+                                // KEY OPTIMIZATION: Clear caches and GC aggressively.
+                                // Remove `data` and `root_*` from GC roots — only keep zoom subtree alive.
+                                // This lets GC free the vast majority of the original tree.
+                                eprintln!("  Clearing caches and running aggressive GC (zoom-only roots)...");
+                                child_cache.clear();
+                                bool_cache.clear();
+                                {
+                                    let mut roots: Vec<u32> = Vec::new();
+                                    for &s in &sels { roots.push(s); }
+                                    roots.extend_from_slice(&[zoom_tl, zoom_tr, zoom_bl, zoom_br]);
+                                    let (total, live, freed) = arena.gc(&roots);
+                                    eprintln!("  Aggressive GC: total={}, live={}, freed={}, free={}",
+                                        total, live, freed, arena.free_list.len());
                                 }
 
                                 // Now zoom_tl/tr/bl/br represent the center of depth 8
                                 // Continue zooming for depths 9-25, rendering at each depth
                                 for depth in 9..=max_depth {
+                                    // Zoom step: extract center children
                                     let new_tl = get_child_fn(&mut arena, zoom_tl, 4, &sels, &mut child_cache, eval_fuel);
                                     let new_tr = get_child_fn(&mut arena, zoom_tr, 3, &sels, &mut child_cache, eval_fuel);
                                     let new_bl = get_child_fn(&mut arena, zoom_bl, 2, &sels, &mut child_cache, eval_fuel);
                                     let new_br = get_child_fn(&mut arena, zoom_br, 1, &sels, &mut child_cache, eval_fuel);
                                     zoom_tl = new_tl; zoom_tr = new_tr; zoom_bl = new_bl; zoom_br = new_br;
+                                    eprintln!("    Zoom to depth {}: arena={} free={}",
+                                        depth, arena.nodes.len(), arena.free_list.len());
+
+                                    // GC after zoom step (before probe/render) — clears intermediate garbage
+                                    child_cache.clear();
+                                    bool_cache.clear();
+                                    {
+                                        let mut roots: Vec<u32> = Vec::new();
+                                        for &s in &sels { roots.push(s); }
+                                        roots.extend_from_slice(&[zoom_tl, zoom_tr, zoom_bl, zoom_br]);
+                                        let (total, live, freed) = arena.gc(&roots);
+                                        eprintln!("    Post-zoom GC: total={}, live={}, freed={}, free={}",
+                                            total, live, freed, arena.free_list.len());
+                                    }
 
                                     // Probe bool_b
                                     let b_tl = get_bool_fn(&mut arena, zoom_tl, &sels, &mut bool_cache, eval_fuel);
                                     let b_tr = get_bool_fn(&mut arena, zoom_tr, &sels, &mut bool_cache, eval_fuel);
                                     let b_bl = get_bool_fn(&mut arena, zoom_bl, &sels, &mut bool_cache, eval_fuel);
                                     let b_br = get_bool_fn(&mut arena, zoom_br, &sels, &mut bool_cache, eval_fuel);
-                                    eprintln!("  Depth {} zoom: TL={:?} TR={:?} BL={:?} BR={:?} arena={} free={}",
+                                    eprintln!("  Depth {} probe: TL={:?} TR={:?} BL={:?} BR={:?} arena={} free={}",
                                         depth, b_tl, b_tr, b_bl, b_br, arena.nodes.len(), arena.free_list.len());
 
-                                    // Render at 16x16 using checkpoint/restore (safe, bounded memory)
-                                    let render_sz: usize = 16;
+                                    // GC after probe, before render
+                                    {
+                                        let mut roots: Vec<u32> = Vec::new();
+                                        for &s in &sels { roots.push(s); }
+                                        roots.extend_from_slice(&[zoom_tl, zoom_tr, zoom_bl, zoom_br]);
+                                        let (total, live, freed) = arena.gc(&roots);
+                                        eprintln!("    Pre-render GC: total={}, live={}, freed={}, free={}",
+                                            total, live, freed, arena.free_list.len());
+                                    }
+
+                                    // Render using shared lazy evaluation
+                                    // NOTE: `data` is NOT in gc_extra_roots — only zoom subtree is kept alive
+                                    let render_sz: usize = 8;
                                     eprintln!("  Rendering depth {} ({}x{} center zoom)...", depth, render_sz, render_sz);
-                                    let pix = render_with_checkpoint(
+                                    let pix = render_shared(
                                         &mut arena,
                                         [zoom_tl, zoom_tr, zoom_bl, zoom_br],
-                                        render_sz, &sels, eval_fuel
+                                        render_sz, &sels, eval_fuel,
+                                        &[zoom_tl, zoom_tr, zoom_bl, zoom_br],
+                                        1_000_000_000
                                     );
                                     let bc = pix.iter().filter(|&&p| p == 0).count();
                                     let wc = pix.iter().filter(|&&p| p == 255).count();
@@ -3082,10 +3094,17 @@ fn main() {
                                     write_pgm(&fname, render_sz, render_sz, &pix);
                                     eprintln!("    Saved: {}", fname);
 
-                                    // GC after each depth
-                                    do_gc(&mut arena, &sels,
-                                        &[data, zoom_tl, zoom_tr, zoom_bl, zoom_br],
-                                        &mut child_cache, &mut bool_cache);
+                                    // GC after each depth — only zoom roots, NO `data`
+                                    child_cache.clear();
+                                    bool_cache.clear();
+                                    {
+                                        let mut roots: Vec<u32> = Vec::new();
+                                        for &s in &sels { roots.push(s); }
+                                        roots.extend_from_slice(&[zoom_tl, zoom_tr, zoom_bl, zoom_br]);
+                                        let (total, live, freed) = arena.gc(&roots);
+                                        eprintln!("    Post-depth GC: total={}, live={}, freed={}, free={}",
+                                            total, live, freed, arena.free_list.len());
+                                    }
                                 }
                             }
                             _ => {

@@ -5,6 +5,7 @@
 
 ## 作業方針
 - 方針や実装の相談は、適宜 `codex exec` を利用してcodexと行うこと
+- 意味のありそうな画像は `png/` フォルダ（imagesの外）にPNG形式で保存する
 
 ## プロジェクト概要
 - `stars.txt` (~400MB) はSKIコンビネータ計算のプログラム
@@ -336,7 +337,43 @@ PXzn-wn-=20, ..., PXzn-wn-zPQ=24
   - sel_3 = `K(K(K(S(KK)(I))))` → QC (SW)
   - sel_4 = `K(K(K(K(I))))` → QD (SE)
 - 抽出方法: `data(sel_i)` で i番目のフィールドを取得
-- **OOM問題**: アリーナが46GBまで膨張してクラッシュ → 容量制限が必要
+
+#### OOM対策: mark-sweep GC + checkpoint/restore
+- **mark-sweep GC実装済み**: ビットマップマーキング → スイープでfree_listに回収
+- **checkpoint/restore機構実装済み**:
+  - `set_checkpoint()`: 現在のarena長を記録、saved_nodesをクリア
+  - `save_node(idx)`: whnfでノード変更前にcheckpoint以前のノードを保存
+  - `restore_checkpoint()`: 保存ノードを復元、新規割当分をtruncate
+  - checkpoint中はfree_listからの再利用を禁止（ベースノードの汚染防止）
+  - whnfの全リダクション規則(I, K, K1, S, S1, S2)にsave_node呼出し追加済み
+  - follow_mutもcheckpoint中はパス圧縮をスキップ
+- **pixel-by-pixel レンダラー (`render_with_checkpoint`)**:
+  - 各ピクセル: set_checkpoint → 四分木をナビゲート → bool_b抽出 → restore_checkpoint
+  - メモリがベースアリーナサイズ(~31.8Mノード)に固定される（蓄積なし）
+- **レンダリング2段階**:
+  - Phase 1 (depth 1-8): 2^(depth-1)解像度でフル描画
+  - Phase 2 (depth 9-25): 中央1/2にズーム、16x16で描画
+
+#### 前回のズームプローブ結果（中央1x1の色）
+| 深さ | TL | TR | BL | BR | 備考 |
+|------|----|----|----|----|------|
+| 9 | F | F | F | F | 全黒 |
+| 10 | T | F | F | T | 対角パターン! |
+| 11 | T | T | T | T | 全白 |
+| 12 | T | T | T | T | 全白 |
+| 13 | T | T | F | T | |
+| 14 | F | T | F | T | |
+| 15 | F | T | F | F | |
+| 16 | F | F | F | T | |
+
+→ 深さ10以降で非自明なパターンあり
+
+#### 現在のレンダリング状況（2026-02-18 17:35実行開始）
+- 実行コマンド: `--fuel 2000000000 --decode io --key 5,0,17,5,3 --img images/zoom`
+- Phase 1: depth 1-6完了（全て真っ黒 = 正常、GMヒント通り）
+- Phase 1: depth 7 (64x64) レンダリング中
+- Arena: 31,842,011ノードで安定（checkpoint/restoreが正常動作）
+- Phase 2 (depth 9-25の中央ズーム) は未着手
 
 ---
 
@@ -365,5 +402,6 @@ PXzn-wn-=20, ..., PXzn-wn-zPQ=24
 - [x] **ナビゲーター調査** — current definition = QfnQ& とサーバーが回答
 - [x] **鍵文字列の検証** — QfnQ& (コード [5,0,17,5,3]) → **正解確認済み**（Step3で鍵エコー、Step4で画像出力）
 - [x] 正しい鍵で画像出力 — Step 4: p1=1, p2=2（画像データ取得成功）
-- [ ] **画像レンダリング** — diamond構造の正しい5引数セレクタで再試行中（OOM対策必要）
+- [x] **OOM対策** — mark-sweep GC + checkpoint/restore機構実装
+- [ ] **画像レンダリング** — checkpoint/restoreベースのpixel-by-pixelレンダラーで実行中（Phase1 depth7進行中）
 - [ ] 最終回答導出
