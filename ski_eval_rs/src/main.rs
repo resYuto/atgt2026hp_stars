@@ -2,7 +2,6 @@
 ///
 /// Arena-based allocation with sharing via indirection nodes.
 /// Reads compact format (k=S, X=K, D=I, -=application).
-
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -13,9 +12,9 @@ const APP: u8 = 0;
 const S: u8 = 1;
 const K: u8 = 2;
 const I: u8 = 3;
-const S1: u8 = 4;  // S applied to 1 arg
-const S2: u8 = 5;  // S applied to 2 args
-const K1: u8 = 6;  // K applied to 1 arg
+const S1: u8 = 4; // S applied to 1 arg
+const S2: u8 = 5; // S applied to 2 args
+const K1: u8 = 6; // K applied to 1 arg
 const IND: u8 = 7; // Indirection (sharing/update)
 
 const NIL: u32 = u32::MAX;
@@ -30,7 +29,7 @@ struct Node {
 struct Arena {
     nodes: Vec<Node>,
     free_list: Vec<u32>,
-    gc_roots: Vec<u32>,  // external roots for GC
+    gc_roots: Vec<u32>, // external roots for GC
     cached_k: Option<u32>,
     cached_i: Option<u32>,
     cached_ki: Option<u32>,
@@ -38,8 +37,8 @@ struct Arena {
     cached_marker_f: Option<u32>,
     cached_diamond_sels: [Option<u32>; 5],
     // Checkpoint/restore for per-pixel rendering
-    checkpoint: Option<usize>,      // arena length at checkpoint
-    saved_nodes: Vec<(u32, Node)>,  // base nodes modified since checkpoint
+    checkpoint: Option<usize>,     // arena length at checkpoint
+    saved_nodes: Vec<(u32, Node)>, // base nodes modified since checkpoint
 }
 
 impl Arena {
@@ -245,7 +244,9 @@ impl Arena {
         }
 
         while let Some(idx) = stack.pop() {
-            if is_marked(&marked, idx) { continue; }
+            if is_marked(&marked, idx) {
+                continue;
+            }
             set_mark(&mut marked, idx);
             let node = self.nodes[idx as usize];
             if node.a != NIL && (node.a as usize) < len && !is_marked(&marked, node.a) {
@@ -293,7 +294,9 @@ impl Arena {
         let mut cur = idx;
         while cur != root {
             let n = &self.nodes[cur as usize];
-            if n.tag != IND { break; }
+            if n.tag != IND {
+                break;
+            }
             let next = n.a;
             self.nodes[cur as usize].a = root;
             cur = next;
@@ -433,22 +436,32 @@ impl Arena {
 
 /// Parse compact string into arena.
 fn parse_compact(arena: &mut Arena, input: &[u8]) -> u32 {
+    // Share primitive combinator nodes across the parsed graph.
+    // APP nodes still represent the full expression structure.
+    let s_node = arena.alloc(S, NIL, NIL);
+    let k_node = arena.alloc(K, NIL, NIL);
+    let i_node = arena.alloc(I, NIL, NIL);
     let mut stack: Vec<u32> = Vec::with_capacity(1024);
     for &c in input {
         match c {
-            b'k' => stack.push(arena.alloc(S, NIL, NIL)),
-            b'X' => stack.push(arena.alloc(K, NIL, NIL)),
-            b'D' => stack.push(arena.alloc(I, NIL, NIL)),
+            b'k' => stack.push(s_node),
+            b'X' => stack.push(k_node),
+            b'D' => stack.push(i_node),
             b'-' => {
                 let y = stack.pop().expect("stack underflow on '-'");
                 let x = stack.pop().expect("stack underflow on '-'");
                 stack.push(arena.alloc(APP, x, y));
             }
             b'\n' | b'\r' | b' ' => {} // skip whitespace
-            _ => {} // skip unknown
+            _ => {}                    // skip unknown
         }
     }
-    assert_eq!(stack.len(), 1, "parse error: stack has {} elements", stack.len());
+    assert_eq!(
+        stack.len(),
+        1,
+        "parse error: stack has {} elements",
+        stack.len()
+    );
     stack[0]
 }
 
@@ -504,9 +517,13 @@ fn decode_bool(arena: &mut Arena, node: u32, fuel: u64) -> Option<bool> {
     let result = arena.whnf(app2, &mut f);
     let result = arena.follow(result);
     let tag = arena.nodes[result as usize].tag;
-    if tag == 100 { Some(true) }
-    else if tag == 101 { Some(false) }
-    else { None }
+    if tag == 100 {
+        Some(true)
+    } else if tag == 101 {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// Decode Scott-encoded binary number.
@@ -520,7 +537,9 @@ fn decode_scott_num(arena: &mut Arena, node: u32, fuel: u64) -> Option<u64> {
     let fuel_per_op = (fuel / 200).max(10000);
 
     for _ in 0..64 {
-        if remaining < fuel_per_op * 4 { break; }
+        if remaining < fuel_per_op * 4 {
+            break;
+        }
 
         // Extract fst (the bit) using 2-arg pair extraction
         let mut f1 = fuel_per_op;
@@ -636,7 +655,9 @@ fn output_byte_stream(arena: &mut Arena, node: u32, fuel: u64) {
 
 /// Describe a WHNF node for debugging.
 fn describe(arena: &Arena, idx: u32, depth: usize) -> String {
-    if depth > 8 { return "...".to_string(); }
+    if depth > 8 {
+        return "...".to_string();
+    }
     let idx = arena.follow(idx);
     let n = &arena.nodes[idx as usize];
     match n.tag {
@@ -649,7 +670,11 @@ fn describe(arena: &Arena, idx: u32, depth: usize) -> String {
             format!("({} {})", f, a)
         }
         S1 => format!("(S {})", describe(arena, n.a, depth + 1)),
-        S2 => format!("(S {} {})", describe(arena, n.a, depth + 1), describe(arena, n.b, depth + 1)),
+        S2 => format!(
+            "(S {} {})",
+            describe(arena, n.a, depth + 1),
+            describe(arena, n.b, depth + 1)
+        ),
         K1 => format!("(K {})", describe(arena, n.a, depth + 1)),
         _ => format!("?{}", n.tag),
     }
@@ -663,10 +688,14 @@ fn decode_number_list(arena: &mut Arena, node: u32, fuel: u64, max_items: usize)
     let mut remaining_fuel = fuel;
 
     for _ in 0..max_items {
-        if remaining_fuel == 0 { break; }
+        if remaining_fuel == 0 {
+            break;
+        }
 
         let is_nil = decode_bool(arena, current, remaining_fuel / 20);
-        if is_nil == Some(false) { break; }
+        if is_nil == Some(false) {
+            break;
+        }
         // None means pair (non-nil) - continue
 
         let mut f1 = remaining_fuel / 20;
@@ -696,10 +725,14 @@ fn decode_bool_list(arena: &mut Arena, node: u32, fuel: u64, max_items: usize) -
     let mut remaining_fuel = fuel;
 
     for _ in 0..max_items {
-        if remaining_fuel == 0 { break; }
+        if remaining_fuel == 0 {
+            break;
+        }
 
         let is_nil = decode_bool(arena, current, remaining_fuel / 20);
-        if is_nil == Some(false) { break; }
+        if is_nil == Some(false) {
+            break;
+        }
         // None means pair (non-nil) - continue
 
         let mut f1 = remaining_fuel / 20;
@@ -761,7 +794,8 @@ fn main() {
             }
             "--key" => {
                 i += 1;
-                key_codes = args[i].split(',')
+                key_codes = args[i]
+                    .split(',')
                     .map(|s| s.trim().parse::<u64>().expect("invalid key code"))
                     .collect();
                 eprintln!("Key codes: {:?}", key_codes);
@@ -806,19 +840,15 @@ fn main() {
                 println!("{}", desc);
             }
         }
-        "bool" => {
-            match decode_bool(&mut arena, result, remaining_fuel) {
-                Some(true) => println!("TRUE"),
-                Some(false) => println!("FALSE"),
-                None => println!("NOT A BOOLEAN"),
-            }
-        }
-        "num" => {
-            match decode_scott_num(&mut arena, result, remaining_fuel) {
-                Some(n) => println!("{}", n),
-                None => println!("NOT A NUMBER"),
-            }
-        }
+        "bool" => match decode_bool(&mut arena, result, remaining_fuel) {
+            Some(true) => println!("TRUE"),
+            Some(false) => println!("FALSE"),
+            None => println!("NOT A BOOLEAN"),
+        },
+        "num" => match decode_scott_num(&mut arena, result, remaining_fuel) {
+            Some(n) => println!("{}", n),
+            None => println!("NOT A NUMBER"),
+        },
         "list" => {
             let nums = decode_number_list(&mut arena, result, remaining_fuel, 100000);
             for n in &nums {
@@ -855,12 +885,17 @@ fn main() {
             match decode_bool(&mut arena, fst, f) {
                 Some(true) => println!("fst = TRUE"),
                 Some(false) => println!("fst = FALSE"),
-                None => {
-                    match decode_scott_num(&mut arena, fst, f) {
-                        Some(n) => println!("fst = NUMBER({})", n),
-                        None => println!("fst = {}", if desc.len() > 200 { &desc[..200] } else { &desc }),
-                    }
-                }
+                None => match decode_scott_num(&mut arena, fst, f) {
+                    Some(n) => println!("fst = NUMBER({})", n),
+                    None => println!(
+                        "fst = {}",
+                        if desc.len() > 200 {
+                            &desc[..200]
+                        } else {
+                            &desc
+                        }
+                    ),
+                },
             }
         }
         "snd" => {
@@ -879,12 +914,17 @@ fn main() {
             match decode_bool(&mut arena, snd, f) {
                 Some(true) => println!("snd = TRUE"),
                 Some(false) => println!("snd = FALSE"),
-                None => {
-                    match decode_scott_num(&mut arena, snd, f) {
-                        Some(n) => println!("snd = NUMBER({})", n),
-                        None => println!("snd = {}", if desc.len() > 200 { &desc[..200] } else { &desc }),
-                    }
-                }
+                None => match decode_scott_num(&mut arena, snd, f) {
+                    Some(n) => println!("snd = NUMBER({})", n),
+                    None => println!(
+                        "snd = {}",
+                        if desc.len() > 200 {
+                            &desc[..200]
+                        } else {
+                            &desc
+                        }
+                    ),
+                },
             }
         }
         "deep" => {
@@ -908,9 +948,26 @@ fn main() {
                 let mut pixels = vec![255u8; size * size]; // default white
                 let mut pixel_count = 0u64;
                 eprintln!("  Diamond {}x{} (depth {})...", size, size, depth);
-                render_diamond(&mut arena, image_data, &mut pixels, 0, 0, size, size, &mut remaining_fuel, &mut pixel_count);
-                eprintln!("    {} pixels rendered, {} nodes", pixel_count, arena.nodes.len());
-                let fname = format!("d:/github/atgt2026hp_stars/images/diamond_{}x{}.pgm", size, size);
+                render_diamond(
+                    &mut arena,
+                    image_data,
+                    &mut pixels,
+                    0,
+                    0,
+                    size,
+                    size,
+                    &mut remaining_fuel,
+                    &mut pixel_count,
+                );
+                eprintln!(
+                    "    {} pixels rendered, {} nodes",
+                    pixel_count,
+                    arena.nodes.len()
+                );
+                let fname = format!(
+                    "d:/github/atgt2026hp_stars/images/diamond_{}x{}.pgm",
+                    size, size
+                );
                 write_pgm(&fname, size, size, &pixels);
                 eprintln!("    Saved {}", fname);
             }
@@ -921,9 +978,26 @@ fn main() {
                 let mut pixels = vec![255u8; size * size];
                 let mut pixel_count = 0u64;
                 eprintln!("  Quadtree v2 {}x{} on snd(result)...", size, size);
-                render_quadtree_v2(&mut arena, image_data, &mut pixels, 0, 0, size, size, &mut remaining_fuel, &mut pixel_count);
-                eprintln!("    {} pixels rendered, {} nodes", pixel_count, arena.nodes.len());
-                let fname = format!("d:/github/atgt2026hp_stars/images/qtree2_snd_{}x{}.pgm", size, size);
+                render_quadtree_v2(
+                    &mut arena,
+                    image_data,
+                    &mut pixels,
+                    0,
+                    0,
+                    size,
+                    size,
+                    &mut remaining_fuel,
+                    &mut pixel_count,
+                );
+                eprintln!(
+                    "    {} pixels rendered, {} nodes",
+                    pixel_count,
+                    arena.nodes.len()
+                );
+                let fname = format!(
+                    "d:/github/atgt2026hp_stars/images/qtree2_snd_{}x{}.pgm",
+                    size, size
+                );
                 write_pgm(&fname, size, size, &pixels);
                 eprintln!("    Saved {}", fname);
             }
@@ -934,9 +1008,26 @@ fn main() {
                 let mut pixels = vec![255u8; size * size];
                 let mut pixel_count = 0u64;
                 eprintln!("  Quadtree v2 {}x{} on full result...", size, size);
-                render_quadtree_v2(&mut arena, result, &mut pixels, 0, 0, size, size, &mut remaining_fuel, &mut pixel_count);
-                eprintln!("    {} pixels rendered, {} nodes", pixel_count, arena.nodes.len());
-                let fname = format!("d:/github/atgt2026hp_stars/images/qtree2_full_{}x{}.pgm", size, size);
+                render_quadtree_v2(
+                    &mut arena,
+                    result,
+                    &mut pixels,
+                    0,
+                    0,
+                    size,
+                    size,
+                    &mut remaining_fuel,
+                    &mut pixel_count,
+                );
+                eprintln!(
+                    "    {} pixels rendered, {} nodes",
+                    pixel_count,
+                    arena.nodes.len()
+                );
+                let fname = format!(
+                    "d:/github/atgt2026hp_stars/images/qtree2_full_{}x{}.pgm",
+                    size, size
+                );
                 write_pgm(&fname, size, size, &pixels);
                 eprintln!("    Saved {}", fname);
             }
@@ -955,7 +1046,13 @@ fn main() {
 
             // Also from full result
             let mut leaves2: Vec<u8> = Vec::new();
-            collect_bool_leaves(&mut arena, result, &mut remaining_fuel, &mut leaves2, 500000);
+            collect_bool_leaves(
+                &mut arena,
+                result,
+                &mut remaining_fuel,
+                &mut leaves2,
+                500000,
+            );
             eprintln!("  From full result: {} boolean leaves", leaves2.len());
             if leaves2.len() > 100 {
                 let sample: Vec<u8> = leaves2[..100].to_vec();
@@ -965,13 +1062,25 @@ fn main() {
             // Try rendering as image with width 4096
             for (name, lvs) in &[("snd", &leaves), ("full", &leaves2)] {
                 let n = lvs.len();
-                if n < 100 { continue; }
+                if n < 100 {
+                    continue;
+                }
                 for width in &[4096usize, 2048, 1024, 512, 256, 128] {
-                    if n < *width { continue; }
+                    if n < *width {
+                        continue;
+                    }
                     let height = n / width;
-                    if height < 10 { continue; }
-                    let mut pixels: Vec<u8> = lvs[..width * height].iter().map(|&b| if b == 1 { 0u8 } else { 255u8 }).collect();
-                    let fname = format!("d:/github/atgt2026hp_stars/images/leaves_{}_{}x{}.pgm", name, width, height);
+                    if height < 10 {
+                        continue;
+                    }
+                    let mut pixels: Vec<u8> = lvs[..width * height]
+                        .iter()
+                        .map(|&b| if b == 1 { 0u8 } else { 255u8 })
+                        .collect();
+                    let fname = format!(
+                        "d:/github/atgt2026hp_stars/images/leaves_{}_{}x{}.pgm",
+                        name, width, height
+                    );
                     write_pgm(&fname, *width, height, &pixels);
                     eprintln!("  Saved {}", fname);
                 }
@@ -984,7 +1093,14 @@ fn main() {
 
             eprintln!("\n=== Level 0: result ===");
             let desc0 = describe(&arena, result, 0);
-            eprintln!("  {}", if desc0.len() > 300 { &desc0[..300] } else { &desc0 });
+            eprintln!(
+                "  {}",
+                if desc0.len() > 300 {
+                    &desc0[..300]
+                } else {
+                    &desc0
+                }
+            );
 
             let a = pair_fst(&mut arena, result, &mut f);
             let b = pair_snd(&mut arena, result, &mut f);
@@ -1077,7 +1193,7 @@ fn main() {
 
             // Pattern 1: result(row)(col) - 2 args
             eprintln!("\n--- Pattern: result(m)(z) ---");
-            for (m, z) in &[(0u64,0u64), (0,1), (1,0), (1,1), (2,3)] {
+            for (m, z) in &[(0u64, 0u64), (0, 1), (1, 0), (1, 1), (2, 3)] {
                 let mn = make_scott_num(&mut arena, *m);
                 let zn = make_scott_num(&mut arena, *z);
                 let app1 = arena.alloc(APP, result, mn);
@@ -1087,13 +1203,23 @@ fn main() {
                 let r = arena.follow(app2);
                 let b = decode_bool(&mut arena, r, 1000000);
                 let desc = describe(&arena, r, 0);
-                let d = if desc.len() > 100 { &desc[..100] } else { &desc };
+                let d = if desc.len() > 100 {
+                    &desc[..100]
+                } else {
+                    &desc
+                };
                 eprintln!("  result({},{}) = {} bool={:?}", m, z, d, b);
             }
 
             // Pattern 2: result(N)(m)(z) - 3 args
             eprintln!("\n--- Pattern: result(N)(m)(z) ---");
-            for (n, m, z) in &[(8u64,0u64,0u64), (8,0,1), (8,1,0), (8,1,1), (8,3,5)] {
+            for (n, m, z) in &[
+                (8u64, 0u64, 0u64),
+                (8, 0, 1),
+                (8, 1, 0),
+                (8, 1, 1),
+                (8, 3, 5),
+            ] {
                 let nn = make_scott_num(&mut arena, *n);
                 let mn = make_scott_num(&mut arena, *m);
                 let zn = make_scott_num(&mut arena, *z);
@@ -1105,13 +1231,17 @@ fn main() {
                 let r = arena.follow(app3);
                 let b = decode_bool(&mut arena, r, 1000000);
                 let desc = describe(&arena, r, 0);
-                let d = if desc.len() > 100 { &desc[..100] } else { &desc };
+                let d = if desc.len() > 100 {
+                    &desc[..100]
+                } else {
+                    &desc
+                };
                 eprintln!("  result({},{},{}) = {} bool={:?}", n, m, z, d, b);
             }
 
             // Pattern 3: result(var)(m)(z) with var=1 (initial call)
             eprintln!("\n--- Pattern: result(1)(m)(z) ---");
-            for (m, z) in &[(0u64,0u64), (0,1), (1,0), (1,1)] {
+            for (m, z) in &[(0u64, 0u64), (0, 1), (1, 0), (1, 1)] {
                 let v1 = make_scott_num(&mut arena, 1);
                 let mn = make_scott_num(&mut arena, *m);
                 let zn = make_scott_num(&mut arena, *z);
@@ -1123,14 +1253,18 @@ fn main() {
                 let r = arena.follow(app3);
                 let b = decode_bool(&mut arena, r, 1000000);
                 let desc = describe(&arena, r, 0);
-                let d = if desc.len() > 100 { &desc[..100] } else { &desc };
+                let d = if desc.len() > 100 {
+                    &desc[..100]
+                } else {
+                    &desc
+                };
                 eprintln!("  result(1,{},{}) = {} bool={:?}", m, z, d, b);
             }
 
             // Pattern 4: snd(result)(args)
             let snd_r = pair_snd(&mut arena, result, &mut f);
             eprintln!("\n--- Pattern: snd(result)(m)(z) ---");
-            for (m, z) in &[(0u64,0u64), (0,1), (1,0), (1,1)] {
+            for (m, z) in &[(0u64, 0u64), (0, 1), (1, 0), (1, 1)] {
                 let mn = make_scott_num(&mut arena, *m);
                 let zn = make_scott_num(&mut arena, *z);
                 let app1 = arena.alloc(APP, snd_r, mn);
@@ -1140,14 +1274,18 @@ fn main() {
                 let r = arena.follow(app2);
                 let b = decode_bool(&mut arena, r, 1000000);
                 let desc = describe(&arena, r, 0);
-                let d = if desc.len() > 100 { &desc[..100] } else { &desc };
+                let d = if desc.len() > 100 {
+                    &desc[..100]
+                } else {
+                    &desc
+                };
                 eprintln!("  snd(r)({},{}) = {} bool={:?}", m, z, d, b);
             }
 
             // Pattern 5: fst(snd(result))(args) - maybe the actual function is deeper
             let fst_snd = pair_fst(&mut arena, snd_r, &mut f);
             eprintln!("\n--- Pattern: fst(snd(result))(m)(z) ---");
-            for (m, z) in &[(0u64,0u64), (0,1), (1,0), (1,1)] {
+            for (m, z) in &[(0u64, 0u64), (0, 1), (1, 0), (1, 1)] {
                 let mn = make_scott_num(&mut arena, *m);
                 let zn = make_scott_num(&mut arena, *z);
                 let app1 = arena.alloc(APP, fst_snd, mn);
@@ -1157,7 +1295,11 @@ fn main() {
                 let r = arena.follow(app2);
                 let b = decode_bool(&mut arena, r, 1000000);
                 let desc = describe(&arena, r, 0);
-                let d = if desc.len() > 100 { &desc[..100] } else { &desc };
+                let d = if desc.len() > 100 {
+                    &desc[..100]
+                } else {
+                    &desc
+                };
                 eprintln!("  fst(snd(r))({},{}) = {} bool={:?}", m, z, d, b);
             }
         }
@@ -1221,7 +1363,9 @@ fn main() {
                             if fn_node.tag == APP {
                                 let fa = arena.follow(fn_node.a);
                                 let fb = arena.follow(fn_node.b);
-                                if arena.nodes[fa as usize].tag == K && arena.nodes[fb as usize].tag == K {
+                                if arena.nodes[fa as usize].tag == K
+                                    && arena.nodes[fb as usize].tag == K
+                                {
                                     val = arena.follow_mut(n.b);
                                     continue;
                                 }
@@ -1242,21 +1386,43 @@ fn main() {
                         fail_count += 1;
                         if fail_examples.len() < 5 {
                             let desc = describe(&arena, val, 0);
-                            let d = if desc.len() > 200 { desc[..200].to_string() } else { desc };
+                            let d = if desc.len() > 200 {
+                                desc[..200].to_string()
+                            } else {
+                                desc
+                            };
                             fail_examples.push((m, z, d));
                         }
                     }
                 }
                 if (m + 1) % 4 == 0 || m == size - 1 {
-                    eprint!("\r  row {}/{} ({} num, {} bool, {} fail, {} nodes)     ",
-                        m + 1, size, num_count, bool_count, fail_count, arena.nodes.len());
+                    eprint!(
+                        "\r  row {}/{} ({} num, {} bool, {} fail, {} nodes)     ",
+                        m + 1,
+                        size,
+                        num_count,
+                        bool_count,
+                        fail_count,
+                        arena.nodes.len()
+                    );
                 }
             }
             eprintln!();
-            eprintln!("  Decoded: {} num, {} bool, {} fail out of {}", num_count, bool_count, fail_count, size * size);
+            eprintln!(
+                "  Decoded: {} num, {} bool, {} fail out of {}",
+                num_count,
+                bool_count,
+                fail_count,
+                size * size
+            );
 
             // Find max value for normalization
-            let max_val = pixels.iter().copied().filter(|&p| p != 128).max().unwrap_or(1);
+            let max_val = pixels
+                .iter()
+                .copied()
+                .filter(|&p| p != 128)
+                .max()
+                .unwrap_or(1);
             eprintln!("  Max pixel value: {}", max_val);
 
             // Save raw image
@@ -1266,10 +1432,18 @@ fn main() {
 
             // Also save normalized version if max > 1
             if max_val > 1 && max_val < 255 {
-                let normalized: Vec<u8> = pixels.iter().map(|&p| {
-                    if p == 128 { 128 } // keep gray for unknown
-                    else { ((p as u32) * 255 / max_val as u32).min(255) as u8 }
-                }).collect();
+                let normalized: Vec<u8> = pixels
+                    .iter()
+                    .map(|&p| {
+                        if p == 128 {
+                            128
+                        }
+                        // keep gray for unknown
+                        else {
+                            ((p as u32) * 255 / max_val as u32).min(255) as u8
+                        }
+                    })
+                    .collect();
                 let fname2 = format!("{}_norm_{}x{}.pgm", img_path, size, size);
                 write_pgm(&fname2, size as usize, size as usize, &normalized);
                 eprintln!("  Saved {}", fname2);
@@ -1300,9 +1474,13 @@ fn main() {
                 eprint!("    ");
                 for z in 0..sample {
                     let p = pixels[(m * size + z) as usize];
-                    if p == 128 { eprint!("? "); }
-                    else if p == 0 { eprint!(". "); }
-                    else { eprint!("# "); }
+                    if p == 128 {
+                        eprint!("? ");
+                    } else if p == 0 {
+                        eprint!(". ");
+                    } else {
+                        eprint!("# ");
+                    }
                 }
                 eprintln!();
             }
@@ -1315,7 +1493,10 @@ fn main() {
             let n_arg = render_var;
             let render_size = if grid_size > 0 { grid_size } else { n_arg };
 
-            eprintln!("Rendering {}x{} image using N={} as format arg...", render_size, render_size, n_arg);
+            eprintln!(
+                "Rendering {}x{} image using N={} as format arg...",
+                render_size, render_size, n_arg
+            );
 
             let mut pixels = vec![128u8; (render_size * render_size) as usize];
             let mut num_count = 0u64;
@@ -1365,7 +1546,9 @@ fn main() {
                             if fn_node.tag == APP {
                                 let fa = arena.follow(fn_node.a);
                                 let fb = arena.follow(fn_node.b);
-                                if arena.nodes[fa as usize].tag == K && arena.nodes[fb as usize].tag == K {
+                                if arena.nodes[fa as usize].tag == K
+                                    && arena.nodes[fb as usize].tag == K
+                                {
                                     val = arena.follow_mut(n.b);
                                     continue;
                                 }
@@ -1384,33 +1567,72 @@ fn main() {
                         fail_count += 1;
                         if fail_examples.len() < 5 {
                             let desc = describe(&arena, val, 0);
-                            let d = if desc.len() > 200 { desc[..200].to_string() } else { desc };
+                            let d = if desc.len() > 200 {
+                                desc[..200].to_string()
+                            } else {
+                                desc
+                            };
                             fail_examples.push((m, z, d));
                         }
                     }
                 }
                 if (m + 1) % 4 == 0 || m == render_size - 1 {
-                    eprint!("\r  row {}/{} ({} num, {} bool, {} fail, {} nodes)     ",
-                        m + 1, render_size, num_count, bool_count, fail_count, arena.nodes.len());
+                    eprint!(
+                        "\r  row {}/{} ({} num, {} bool, {} fail, {} nodes)     ",
+                        m + 1,
+                        render_size,
+                        num_count,
+                        bool_count,
+                        fail_count,
+                        arena.nodes.len()
+                    );
                 }
             }
             eprintln!();
-            eprintln!("  Decoded: {} num, {} bool, {} fail out of {}", num_count, bool_count, fail_count, render_size * render_size);
+            eprintln!(
+                "  Decoded: {} num, {} bool, {} fail out of {}",
+                num_count,
+                bool_count,
+                fail_count,
+                render_size * render_size
+            );
 
-            let max_val = pixels.iter().copied().filter(|&p| p != 128).max().unwrap_or(1);
+            let max_val = pixels
+                .iter()
+                .copied()
+                .filter(|&p| p != 128)
+                .max()
+                .unwrap_or(1);
             eprintln!("  Max pixel value: {}", max_val);
 
-            let fname = format!("{}_N{}_{}x{}.pgm", img_path, n_arg, render_size, render_size);
+            let fname = format!(
+                "{}_N{}_{}x{}.pgm",
+                img_path, n_arg, render_size, render_size
+            );
             write_pgm(&fname, render_size as usize, render_size as usize, &pixels);
             eprintln!("  Saved {}", fname);
 
             if max_val > 1 && max_val < 255 {
-                let normalized: Vec<u8> = pixels.iter().map(|&p| {
-                    if p == 128 { 128 }
-                    else { ((p as u32) * 255 / max_val as u32).min(255) as u8 }
-                }).collect();
-                let fname2 = format!("{}_N{}_norm_{}x{}.pgm", img_path, n_arg, render_size, render_size);
-                write_pgm(&fname2, render_size as usize, render_size as usize, &normalized);
+                let normalized: Vec<u8> = pixels
+                    .iter()
+                    .map(|&p| {
+                        if p == 128 {
+                            128
+                        } else {
+                            ((p as u32) * 255 / max_val as u32).min(255) as u8
+                        }
+                    })
+                    .collect();
+                let fname2 = format!(
+                    "{}_N{}_norm_{}x{}.pgm",
+                    img_path, n_arg, render_size, render_size
+                );
+                write_pgm(
+                    &fname2,
+                    render_size as usize,
+                    render_size as usize,
+                    &normalized,
+                );
                 eprintln!("  Saved {}", fname2);
             }
 
@@ -1438,7 +1660,21 @@ fn main() {
             eprintln!("Examining result structure...");
             let r = arena.follow(result);
             let rn = arena.nodes[r as usize];
-            eprintln!("result: tag={} ({})", rn.tag, match rn.tag { 0=>"APP",1=>"S",2=>"K",3=>"I",4=>"S1",5=>"S2",6=>"K1",7=>"IND",_=>"?" });
+            eprintln!(
+                "result: tag={} ({})",
+                rn.tag,
+                match rn.tag {
+                    0 => "APP",
+                    1 => "S",
+                    2 => "K",
+                    3 => "I",
+                    4 => "S1",
+                    5 => "S2",
+                    6 => "K1",
+                    7 => "IND",
+                    _ => "?",
+                }
+            );
 
             if rn.tag == S2 {
                 // result = S2(f, Y)
@@ -1515,14 +1751,20 @@ fn main() {
             } else if rn.tag == APP {
                 let la = arena.follow(rn.a);
                 let lb = arena.follow(rn.b);
-                eprintln!("  APP: left tag={} right tag={}", arena.nodes[la as usize].tag, arena.nodes[lb as usize].tag);
+                eprintln!(
+                    "  APP: left tag={} right tag={}",
+                    arena.nodes[la as usize].tag, arena.nodes[lb as usize].tag
+                );
 
                 // Navigate deeper if left is also APP
                 let la_node = arena.nodes[la as usize];
                 if la_node.tag == APP {
                     let lla = arena.follow(la_node.a);
                     let llb = arena.follow(la_node.b);
-                    eprintln!("  Left is APP(tag={}, tag={})", arena.nodes[lla as usize].tag, arena.nodes[llb as usize].tag);
+                    eprintln!(
+                        "  Left is APP(tag={}, tag={})",
+                        arena.nodes[lla as usize].tag, arena.nodes[llb as usize].tag
+                    );
                     if arena.nodes[lla as usize].tag == S {
                         eprintln!("  → result = S(f)(Y) where f and Y are:");
                         eprintln!("  f = {}", describe(&arena, llb, 3));
@@ -1540,24 +1782,47 @@ fn main() {
             let rn = arena.follow(app);
             let desc = describe(&arena, rn, 0);
             eprintln!("result({}) WHNF:", render_var);
-            eprintln!("  {}", if desc.len() > 3000 { &desc[..3000] } else { &desc });
+            eprintln!(
+                "  {}",
+                if desc.len() > 3000 {
+                    &desc[..3000]
+                } else {
+                    &desc
+                }
+            );
 
             // Try as number list
             let nums = decode_number_list(&mut arena, rn, f.min(10_000_000), 200);
             if !nums.is_empty() {
-                eprintln!("As number list ({} items): {:?}", nums.len(), &nums[..nums.len().min(50)]);
+                eprintln!(
+                    "As number list ({} items): {:?}",
+                    nums.len(),
+                    &nums[..nums.len().min(50)]
+                );
             }
 
             // Try as bool list
             let bools = decode_bool_list(&mut arena, rn, f.min(10_000_000), 200);
             if !bools.is_empty() {
-                eprintln!("As bool list ({} items): {:?}", bools.len(), &bools[..bools.len().min(50)]);
+                eprintln!(
+                    "As bool list ({} items): {:?}",
+                    bools.len(),
+                    &bools[..bools.len().min(50)]
+                );
             }
 
             // Try fst
             let fst_val = pair_fst(&mut arena, rn, &mut f);
             let fst_desc = describe(&arena, fst_val, 0);
-            eprintln!("fst(result({})): {}", render_var, if fst_desc.len() > 1000 { &fst_desc[..1000] } else { &fst_desc });
+            eprintln!(
+                "fst(result({})): {}",
+                render_var,
+                if fst_desc.len() > 1000 {
+                    &fst_desc[..1000]
+                } else {
+                    &fst_desc
+                }
+            );
             if let Some(n) = decode_scott_num(&mut arena, fst_val, f.min(5_000_000)) {
                 eprintln!("  = NUMBER({})", n);
             }
@@ -1568,7 +1833,15 @@ fn main() {
             // Try snd
             let snd_val = pair_snd(&mut arena, rn, &mut f);
             let snd_desc = describe(&arena, snd_val, 0);
-            eprintln!("snd(result({})): {}", render_var, if snd_desc.len() > 1000 { &snd_desc[..1000] } else { &snd_desc });
+            eprintln!(
+                "snd(result({})): {}",
+                render_var,
+                if snd_desc.len() > 1000 {
+                    &snd_desc[..1000]
+                } else {
+                    &snd_desc
+                }
+            );
             if let Some(n) = decode_scott_num(&mut arena, snd_val, f.min(5_000_000)) {
                 eprintln!("  = NUMBER({})", n);
             }
@@ -1583,7 +1856,15 @@ fn main() {
             arena.whnf(app_zero, &mut f2);
             let r0 = arena.follow(app_zero);
             let r0_desc = describe(&arena, r0, 0);
-            eprintln!("result({})(0): {}", render_var, if r0_desc.len() > 1000 { &r0_desc[..1000] } else { &r0_desc });
+            eprintln!(
+                "result({})(0): {}",
+                render_var,
+                if r0_desc.len() > 1000 {
+                    &r0_desc[..1000]
+                } else {
+                    &r0_desc
+                }
+            );
 
             // Try result(N)(0)(0)
             let zero2 = make_scott_num(&mut arena, 0);
@@ -1592,7 +1873,15 @@ fn main() {
             arena.whnf(app_00, &mut f3);
             let r00 = arena.follow(app_00);
             let r00_desc = describe(&arena, r00, 0);
-            eprintln!("result({})(0)(0): {}", render_var, if r00_desc.len() > 500 { &r00_desc[..500] } else { &r00_desc });
+            eprintln!(
+                "result({})(0)(0): {}",
+                render_var,
+                if r00_desc.len() > 500 {
+                    &r00_desc[..500]
+                } else {
+                    &r00_desc
+                }
+            );
             if let Some(n) = decode_scott_num(&mut arena, r00, f.min(5_000_000)) {
                 eprintln!("  = NUMBER({})", n);
             }
@@ -1610,8 +1899,14 @@ fn main() {
             let n_end = if grid_size > 0 { grid_size } else { 512 };
 
             let test_coords: Vec<(u64, u64)> = vec![
-                (0, 0), (0, 1), (1, 0), (1, 1),
-                (0, 2), (2, 0), (2, 1), (1, 2),
+                (0, 0),
+                (0, 1),
+                (1, 0),
+                (1, 1),
+                (0, 2),
+                (2, 0),
+                (2, 1),
+                (1, 2),
             ];
 
             for n in n_start..=n_end {
@@ -1619,7 +1914,9 @@ fn main() {
                 let mut all_ok = true;
 
                 for &(m, z) in &test_coords {
-                    if m >= n || z >= n { continue; }
+                    if m >= n || z >= n {
+                        continue;
+                    }
                     let var_n = make_scott_num(&mut arena, n);
                     let m_n = make_scott_num(&mut arena, m);
                     let z_n = make_scott_num(&mut arena, z);
@@ -1655,25 +1952,63 @@ fn main() {
                         pixel_vals.push((m, z, format!("{}", if b { "T" } else { "F" })));
                     } else {
                         let desc = describe(&arena, val, 0);
-                        let d = if desc.len() > 60 { desc[..60].to_string() } else { desc };
+                        let d = if desc.len() > 60 {
+                            desc[..60].to_string()
+                        } else {
+                            desc
+                        };
                         pixel_vals.push((m, z, format!("?{}", d)));
                         all_ok = false;
                     }
                 }
 
                 // Check if row 0 and row 1 differ (gradient test)
-                let r0c1 = pixel_vals.iter().find(|(m,z,_)| *m == 0 && *z == 1).map(|(_,_,v)| v.as_str()).unwrap_or("");
-                let r1c1 = pixel_vals.iter().find(|(m,z,_)| *m == 1 && *z == 1).map(|(_,_,v)| v.as_str()).unwrap_or("");
-                let r0c0 = pixel_vals.iter().find(|(m,z,_)| *m == 0 && *z == 0).map(|(_,_,v)| v.as_str()).unwrap_or("");
-                let r1c0 = pixel_vals.iter().find(|(m,z,_)| *m == 1 && *z == 0).map(|(_,_,v)| v.as_str()).unwrap_or("");
-                let r2c0 = pixel_vals.iter().find(|(m,z,_)| *m == 2 && *z == 0).map(|(_,_,v)| v.as_str()).unwrap_or("");
-                let r2c1 = pixel_vals.iter().find(|(m,z,_)| *m == 2 && *z == 1).map(|(_,_,v)| v.as_str()).unwrap_or("");
+                let r0c1 = pixel_vals
+                    .iter()
+                    .find(|(m, z, _)| *m == 0 && *z == 1)
+                    .map(|(_, _, v)| v.as_str())
+                    .unwrap_or("");
+                let r1c1 = pixel_vals
+                    .iter()
+                    .find(|(m, z, _)| *m == 1 && *z == 1)
+                    .map(|(_, _, v)| v.as_str())
+                    .unwrap_or("");
+                let r0c0 = pixel_vals
+                    .iter()
+                    .find(|(m, z, _)| *m == 0 && *z == 0)
+                    .map(|(_, _, v)| v.as_str())
+                    .unwrap_or("");
+                let r1c0 = pixel_vals
+                    .iter()
+                    .find(|(m, z, _)| *m == 1 && *z == 0)
+                    .map(|(_, _, v)| v.as_str())
+                    .unwrap_or("");
+                let r2c0 = pixel_vals
+                    .iter()
+                    .find(|(m, z, _)| *m == 2 && *z == 0)
+                    .map(|(_, _, v)| v.as_str())
+                    .unwrap_or("");
+                let r2c1 = pixel_vals
+                    .iter()
+                    .find(|(m, z, _)| *m == 2 && *z == 1)
+                    .map(|(_, _, v)| v.as_str())
+                    .unwrap_or("");
 
                 let rows_differ = r0c1 != r1c1 || r0c0 != r1c0;
                 let marker = if rows_differ { "OK" } else { "GRAD?" };
 
-                eprintln!("  N={:4}: [{}] (0,0)={} (0,1)={} (1,0)={} (1,1)={} (2,0)={} (2,1)={} nodes={}",
-                    n, marker, r0c0, r0c1, r1c0, r1c1, r2c0, r2c1, arena.nodes.len());
+                eprintln!(
+                    "  N={:4}: [{}] (0,0)={} (0,1)={} (1,0)={} (1,1)={} (2,0)={} (2,1)={} nodes={}",
+                    n,
+                    marker,
+                    r0c0,
+                    r0c1,
+                    r1c0,
+                    r1c1,
+                    r2c0,
+                    r2c1,
+                    arena.nodes.len()
+                );
             }
         }
         "probe3" => {
@@ -1696,11 +2031,19 @@ fn main() {
                     let r = arena.follow(app3);
 
                     let num = decode_scott_num(&mut arena, r, 1_000_000);
-                    let b = if num.is_none() { decode_bool(&mut arena, r, 500_000) } else { None };
+                    let b = if num.is_none() {
+                        decode_bool(&mut arena, r, 500_000)
+                    } else {
+                        None
+                    };
                     eprint!("  ({},{})=", m, z);
-                    if let Some(n) = num { eprint!("N{}", n); }
-                    else if let Some(b) = b { eprint!("B{}", b as u8); }
-                    else { eprint!("??"); }
+                    if let Some(n) = num {
+                        eprint!("N{}", n);
+                    } else if let Some(b) = b {
+                        eprint!("B{}", b as u8);
+                    } else {
+                        eprint!("??");
+                    }
                 }
                 eprintln!();
             }
@@ -1719,11 +2062,17 @@ fn main() {
                     arena.whnf(app3, &mut pf);
                     let r = arena.follow(app3);
                     let num = decode_scott_num(&mut arena, r, 1_000_000);
-                    let b = if num.is_none() { decode_bool(&mut arena, r, 500_000) } else { None };
+                    let b = if num.is_none() {
+                        decode_bool(&mut arena, r, 500_000)
+                    } else {
+                        None
+                    };
                     eprint!("  ({},{})=", m, z);
-                    if let Some(n) = num { eprint!("N{}", n); }
-                    else if let Some(b) = b { eprint!("B{}", b as u8); }
-                    else {
+                    if let Some(n) = num {
+                        eprint!("N{}", n);
+                    } else if let Some(b) = b {
+                        eprint!("B{}", b as u8);
+                    } else {
                         let desc = describe(&arena, r, 0);
                         let d = if desc.len() > 60 { &desc[..60] } else { &desc };
                         eprint!("[{}]", d);
@@ -1744,11 +2093,19 @@ fn main() {
                     arena.whnf(app2, &mut pf);
                     let r = arena.follow(app2);
                     let num = decode_scott_num(&mut arena, r, 1_000_000);
-                    let b = if num.is_none() { decode_bool(&mut arena, r, 500_000) } else { None };
+                    let b = if num.is_none() {
+                        decode_bool(&mut arena, r, 500_000)
+                    } else {
+                        None
+                    };
                     eprint!("  ({},{})=", m, z);
-                    if let Some(n) = num { eprint!("N{}", n); }
-                    else if let Some(b) = b { eprint!("B{}", b as u8); }
-                    else { eprint!("??"); }
+                    if let Some(n) = num {
+                        eprint!("N{}", n);
+                    } else if let Some(b) = b {
+                        eprint!("B{}", b as u8);
+                    } else {
+                        eprint!("??");
+                    }
                 }
                 eprintln!();
             }
@@ -1771,7 +2128,14 @@ fn main() {
             eprintln!("\n=== Step 1: A = fst(result) ===");
             let a = pair_fst(&mut arena, result, &mut f);
             let desc_a = describe(&arena, a, 0);
-            eprintln!("  A = {}", if desc_a.len() > 500 { &desc_a[..500] } else { &desc_a });
+            eprintln!(
+                "  A = {}",
+                if desc_a.len() > 500 {
+                    &desc_a[..500]
+                } else {
+                    &desc_a
+                }
+            );
 
             // Step 1b: Verify snd(result) = FALSE (end marker)
             eprintln!("\n=== Step 1b: snd(result) - should be FALSE ===");
@@ -1781,7 +2145,14 @@ fn main() {
                 Some(false) => eprintln!("  snd(result) = FALSE  ✓ (end marker)"),
                 None => {
                     let desc = describe(&arena, b_ki, 0);
-                    eprintln!("  snd(result) = NOT BOOL: {}", if desc.len() > 200 { &desc[..200] } else { &desc });
+                    eprintln!(
+                        "  snd(result) = NOT BOOL: {}",
+                        if desc.len() > 200 {
+                            &desc[..200]
+                        } else {
+                            &desc
+                        }
+                    );
                 }
             }
 
@@ -1797,9 +2168,16 @@ fn main() {
                     Some(n) => eprintln!("    NUMBER({})", n),
                     None => {
                         let desc = describe(&arena, a_fst, 0);
-                        eprintln!("    {}", if desc.len() > 300 { &desc[..300] } else { &desc });
+                        eprintln!(
+                            "    {}",
+                            if desc.len() > 300 {
+                                &desc[..300]
+                            } else {
+                                &desc
+                            }
+                        );
                     }
-                }
+                },
             }
 
             eprintln!("  snd(A) =");
@@ -1809,9 +2187,16 @@ fn main() {
                     Some(n) => eprintln!("    NUMBER({})", n),
                     None => {
                         let desc = describe(&arena, a_snd, 0);
-                        eprintln!("    {}", if desc.len() > 300 { &desc[..300] } else { &desc });
+                        eprintln!(
+                            "    {}",
+                            if desc.len() > 300 {
+                                &desc[..300]
+                            } else {
+                                &desc
+                            }
+                        );
                     }
-                }
+                },
             }
 
             // Step 3: Go deeper - decompose fst(A) and snd(A)
@@ -1826,9 +2211,16 @@ fn main() {
                     Some(n) => eprintln!("    NUMBER({})", n),
                     None => {
                         let desc = describe(&arena, aa_fst, 0);
-                        eprintln!("    {}", if desc.len() > 200 { &desc[..200] } else { &desc });
+                        eprintln!(
+                            "    {}",
+                            if desc.len() > 200 {
+                                &desc[..200]
+                            } else {
+                                &desc
+                            }
+                        );
                     }
-                }
+                },
             }
 
             // snd(fst(A))
@@ -1840,9 +2232,16 @@ fn main() {
                     Some(n) => eprintln!("    NUMBER({})", n),
                     None => {
                         let desc = describe(&arena, aa_snd, 0);
-                        eprintln!("    {}", if desc.len() > 200 { &desc[..200] } else { &desc });
+                        eprintln!(
+                            "    {}",
+                            if desc.len() > 200 {
+                                &desc[..200]
+                            } else {
+                                &desc
+                            }
+                        );
                     }
-                }
+                },
             }
 
             // fst(snd(A))
@@ -1854,9 +2253,16 @@ fn main() {
                     Some(n) => eprintln!("    NUMBER({})", n),
                     None => {
                         let desc = describe(&arena, ab_fst, 0);
-                        eprintln!("    {}", if desc.len() > 200 { &desc[..200] } else { &desc });
+                        eprintln!(
+                            "    {}",
+                            if desc.len() > 200 {
+                                &desc[..200]
+                            } else {
+                                &desc
+                            }
+                        );
                     }
-                }
+                },
             }
 
             // snd(snd(A))
@@ -1868,9 +2274,16 @@ fn main() {
                     Some(n) => eprintln!("    NUMBER({})", n),
                     None => {
                         let desc = describe(&arena, ab_snd, 0);
-                        eprintln!("    {}", if desc.len() > 200 { &desc[..200] } else { &desc });
+                        eprintln!(
+                            "    {}",
+                            if desc.len() > 200 {
+                                &desc[..200]
+                            } else {
+                                &desc
+                            }
+                        );
                     }
-                }
+                },
             }
 
             // Step 4: Try various candidates as EXPR - call with (1)(0)(0) and check for diamond
@@ -1898,7 +2311,11 @@ fn main() {
 
                 let b = decode_bool(&mut arena, r, 1_000_000);
                 let desc = describe(&arena, r, 0);
-                let d = if desc.len() > 200 { &desc[..200] } else { &desc };
+                let d = if desc.len() > 200 {
+                    &desc[..200]
+                } else {
+                    &desc
+                };
                 eprintln!("  {}(1)(0)(0) = {} bool={:?}", name, d, b);
 
                 // If it's a non-boolean, check if it has diamond structure
@@ -1909,7 +2326,11 @@ fn main() {
                     let rest = pair_snd(&mut arena, r, &mut f);
                     let qa = pair_fst(&mut arena, rest, &mut f);
                     let qa_bool = decode_bool(&mut arena, qa, 500_000);
-                    eprintln!("    diamond? cond={:?} qa_is_pair={}", cond_bool, qa_bool.is_none());
+                    eprintln!(
+                        "    diamond? cond={:?} qa_is_pair={}",
+                        cond_bool,
+                        qa_bool.is_none()
+                    );
                 }
             }
 
@@ -1921,7 +2342,14 @@ fn main() {
             arena.whnf(ri, &mut pf);
             let ri_val = arena.follow(ri);
             let desc_ri = describe(&arena, ri_val, 0);
-            eprintln!("  result(I) = {}", if desc_ri.len() > 500 { &desc_ri[..500] } else { &desc_ri });
+            eprintln!(
+                "  result(I) = {}",
+                if desc_ri.len() > 500 {
+                    &desc_ri[..500]
+                } else {
+                    &desc_ri
+                }
+            );
 
             // Try result(I)(1)(0)(0)
             let one = make_scott_num(&mut arena, 1);
@@ -1935,7 +2363,11 @@ fn main() {
             let r = arena.follow(app3);
             let b = decode_bool(&mut arena, r, 1_000_000);
             let desc = describe(&arena, r, 0);
-            let d = if desc.len() > 200 { &desc[..200] } else { &desc };
+            let d = if desc.len() > 200 {
+                &desc[..200]
+            } else {
+                &desc
+            };
             eprintln!("  result(I)(1)(0)(0) = {} bool={:?}", d, b);
 
             // Step 6: Try passing a handler that captures the second arg
@@ -1949,7 +2381,14 @@ fn main() {
             arena.whnf(rh, &mut pf);
             let rh_val = arena.follow(rh);
             let desc_rh = describe(&arena, rh_val, 0);
-            eprintln!("  result(KI) = {}", if desc_rh.len() > 300 { &desc_rh[..300] } else { &desc_rh });
+            eprintln!(
+                "  result(KI) = {}",
+                if desc_rh.len() > 300 {
+                    &desc_rh[..300]
+                } else {
+                    &desc_rh
+                }
+            );
             let rh_bool = decode_bool(&mut arena, rh_val, 1_000_000);
             eprintln!("    bool={:?}", rh_bool);
 
@@ -1960,7 +2399,14 @@ fn main() {
             arena.whnf(rk, &mut pf);
             let rk_val = arena.follow(rk);
             let desc_rk = describe(&arena, rk_val, 0);
-            eprintln!("  result(K) = {}", if desc_rk.len() > 300 { &desc_rk[..300] } else { &desc_rk });
+            eprintln!(
+                "  result(K) = {}",
+                if desc_rk.len() > 300 {
+                    &desc_rk[..300]
+                } else {
+                    &desc_rk
+                }
+            );
 
             // Try calling result(K)(1)(0)(0) - maybe result(K) IS the EXPR?
             let one = make_scott_num(&mut arena, 1);
@@ -1974,7 +2420,11 @@ fn main() {
             let r = arena.follow(app3);
             let b_val = decode_bool(&mut arena, r, 1_000_000);
             let desc = describe(&arena, r, 0);
-            let d = if desc.len() > 200 { &desc[..200] } else { &desc };
+            let d = if desc.len() > 200 {
+                &desc[..200]
+            } else {
+                &desc
+            };
             eprintln!("  result(K)(1)(0)(0) = {} bool={:?}", d, b_val);
 
             // Step 7: Extract B from S2 node directly
@@ -1989,11 +2439,19 @@ fn main() {
                 let b_part = arena.follow(rn.b);
                 eprintln!("  f = {}", {
                     let d = describe(&arena, f_part, 0);
-                    if d.len() > 200 { d[..200].to_string() } else { d }
+                    if d.len() > 200 {
+                        d[..200].to_string()
+                    } else {
+                        d
+                    }
                 });
                 eprintln!("  B = {}", {
                     let d = describe(&arena, b_part, 0);
-                    if d.len() > 200 { d[..200].to_string() } else { d }
+                    if d.len() > 200 {
+                        d[..200].to_string()
+                    } else {
+                        d
+                    }
                 });
 
                 // B(K) = fst of the next pipeline level
@@ -2011,7 +2469,7 @@ fn main() {
                             let d = describe(&arena, bk_val, 0);
                             eprintln!("    {}", if d.len() > 500 { &d[..500] } else { &d });
                         }
-                    }
+                    },
                 }
 
                 // B(KI) = snd of the next pipeline level
@@ -2029,7 +2487,7 @@ fn main() {
                             let d = describe(&arena, bki_val, 0);
                             eprintln!("    {}", if d.len() > 500 { &d[..500] } else { &d });
                         }
-                    }
+                    },
                 }
 
                 // Now check if B is ALSO an S2 node (nested pipeline)
@@ -2040,11 +2498,19 @@ fn main() {
                     let b_b = arena.follow(bn.b); // This is C, the next level
                     eprintln!("  B.f = {}", {
                         let d = describe(&arena, b_f, 0);
-                        if d.len() > 200 { d[..200].to_string() } else { d }
+                        if d.len() > 200 {
+                            d[..200].to_string()
+                        } else {
+                            d
+                        }
                     });
                     eprintln!("  B.B (=C) = {}", {
                         let d = describe(&arena, b_b, 0);
-                        if d.len() > 200 { d[..200].to_string() } else { d }
+                        if d.len() > 200 {
+                            d[..200].to_string()
+                        } else {
+                            d
+                        }
                     });
 
                     // C(K) = fst of NEXT next level
@@ -2062,7 +2528,7 @@ fn main() {
                                 let d = describe(&arena, ck_val, 0);
                                 eprintln!("    {}", if d.len() > 500 { &d[..500] } else { &d });
                             }
-                        }
+                        },
                     }
 
                     // C(KI) = snd
@@ -2094,7 +2560,11 @@ fn main() {
                 let r = arena.follow(app3);
                 let b_check = decode_bool(&mut arena, r, 1_000_000);
                 let desc = describe(&arena, r, 0);
-                let d = if desc.len() > 500 { &desc[..500] } else { &desc };
+                let d = if desc.len() > 500 {
+                    &desc[..500]
+                } else {
+                    &desc
+                };
                 eprintln!("  B(K)(1)(0)(0) = {} bool={:?}", d, b_check);
                 // Check diamond structure
                 if b_check.is_none() {
@@ -2124,7 +2594,7 @@ fn main() {
                             let d = describe(&arena, bk_fst, 0);
                             eprintln!("    {}", if d.len() > 300 { &d[..300] } else { &d });
                         }
-                    }
+                    },
                 }
                 eprintln!("  snd(B(K)) =");
                 match decode_bool(&mut arena, bk_snd, 1_000_000) {
@@ -2135,7 +2605,7 @@ fn main() {
                             let d = describe(&arena, bk_snd, 0);
                             eprintln!("    {}", if d.len() > 300 { &d[..300] } else { &d });
                         }
-                    }
+                    },
                 }
             } else {
                 eprintln!("  Result is NOT S2 - tag = {}", rn.tag);
@@ -2159,7 +2629,11 @@ fn main() {
             } else if rn.tag == APP {
                 // result = APP(something, B). B is the second component.
                 let b_raw = arena.follow(rn.b);
-                eprintln!("  result is APP: .a tag={}, .b tag={}", arena.nodes[arena.follow(rn.a) as usize].tag, arena.nodes[b_raw as usize].tag);
+                eprintln!(
+                    "  result is APP: .a tag={}, .b tag={}",
+                    arena.nodes[arena.follow(rn.a) as usize].tag,
+                    arena.nodes[b_raw as usize].tag
+                );
                 Some(b_raw)
             } else {
                 None
@@ -2209,13 +2683,26 @@ fn main() {
                             let mut pixels = vec![255u8; size * size];
                             let mut pixel_count = 0u64;
                             let mut rf = remaining_fuel.min(500_000_000);
-                            render_diamond(&mut arena, yn_result, &mut pixels, 0, 0, size, size, &mut rf, &mut pixel_count);
+                            render_diamond(
+                                &mut arena,
+                                yn_result,
+                                &mut pixels,
+                                0,
+                                0,
+                                size,
+                                size,
+                                &mut rf,
+                                &mut pixel_count,
+                            );
                             let black = pixels.iter().filter(|&&p| p == 0).count();
                             let white = pixels.iter().filter(|&&p| p == 255).count();
                             let gray = pixels.iter().filter(|&&p| p == 128).count();
-                            eprintln!("    {}x{}: {} pix rendered, black={}, white={}, gray={}",
-                                size, size, pixel_count, black, white, gray);
-                            let fname = format!("{}_Yn{}_diamond_{}x{}.pgm", img_path, n_val, size, size);
+                            eprintln!(
+                                "    {}x{}: {} pix rendered, black={}, white={}, gray={}",
+                                size, size, pixel_count, black, white, gray
+                            );
+                            let fname =
+                                format!("{}_Yn{}_diamond_{}x{}.pgm", img_path, n_val, size, size);
                             write_pgm(&fname, size, size, &pixels);
                             eprintln!("    Saved {}", fname);
                         }
@@ -2237,12 +2724,28 @@ fn main() {
                     let mut pixel_count = 0u64;
                     let mut rf = remaining_fuel.min(500_000_000);
                     eprintln!("  Diamond {}x{} from Y(4)...", size, size);
-                    render_diamond(&mut arena, y4, &mut pixels, 0, 0, size, size, &mut rf, &mut pixel_count);
+                    render_diamond(
+                        &mut arena,
+                        y4,
+                        &mut pixels,
+                        0,
+                        0,
+                        size,
+                        size,
+                        &mut rf,
+                        &mut pixel_count,
+                    );
                     let black = pixels.iter().filter(|&&p| p == 0).count();
                     let white = pixels.iter().filter(|&&p| p == 255).count();
                     let gray = pixels.iter().filter(|&&p| p == 128).count();
-                    eprintln!("    {} pix, black={}, white={}, gray={}, nodes={}",
-                        pixel_count, black, white, gray, arena.nodes.len());
+                    eprintln!(
+                        "    {} pix, black={}, white={}, gray={}, nodes={}",
+                        pixel_count,
+                        black,
+                        white,
+                        gray,
+                        arena.nodes.len()
+                    );
                     let fname = format!("{}_Y4_diamond_{}x{}.pgm", img_path, size, size);
                     write_pgm(&fname, size, size, &pixels);
                     eprintln!("    Saved {}", fname);
@@ -2263,12 +2766,28 @@ fn main() {
                     let mut pixel_count = 0u64;
                     let mut rf = remaining_fuel.min(500_000_000);
                     eprintln!("  Diamond {}x{} from Y(16)...", size, size);
-                    render_diamond(&mut arena, y16, &mut pixels, 0, 0, size, size, &mut rf, &mut pixel_count);
+                    render_diamond(
+                        &mut arena,
+                        y16,
+                        &mut pixels,
+                        0,
+                        0,
+                        size,
+                        size,
+                        &mut rf,
+                        &mut pixel_count,
+                    );
                     let black = pixels.iter().filter(|&&p| p == 0).count();
                     let white = pixels.iter().filter(|&&p| p == 255).count();
                     let gray = pixels.iter().filter(|&&p| p == 128).count();
-                    eprintln!("    {} pix, black={}, white={}, gray={}, nodes={}",
-                        pixel_count, black, white, gray, arena.nodes.len());
+                    eprintln!(
+                        "    {} pix, black={}, white={}, gray={}, nodes={}",
+                        pixel_count,
+                        black,
+                        white,
+                        gray,
+                        arena.nodes.len()
+                    );
                     let fname = format!("{}_Y16_diamond_{}x{}.pgm", img_path, size, size);
                     write_pgm(&fname, size, size, &pixels);
                     eprintln!("    Saved {}", fname);
@@ -2299,13 +2818,26 @@ fn main() {
                         let mut pixel_count = 0u64;
                         let mut rf = remaining_fuel.min(500_000_000);
                         eprintln!("    Diamond {}x{} from result({})...", size, size, n_val);
-                        render_diamond(&mut arena, rn_result, &mut pixels, 0, 0, size, size, &mut rf, &mut pixel_count);
+                        render_diamond(
+                            &mut arena,
+                            rn_result,
+                            &mut pixels,
+                            0,
+                            0,
+                            size,
+                            size,
+                            &mut rf,
+                            &mut pixel_count,
+                        );
                         let black = pixels.iter().filter(|&&p| p == 0).count();
                         let white = pixels.iter().filter(|&&p| p == 255).count();
                         let gray = pixels.iter().filter(|&&p| p == 128).count();
-                        eprintln!("    {} pix, black={}, white={}, gray={}",
-                            pixel_count, black, white, gray);
-                        let fname = format!("{}_result{}_diamond_{}x{}.pgm", img_path, n_val, size, size);
+                        eprintln!(
+                            "    {} pix, black={}, white={}, gray={}",
+                            pixel_count, black, white, gray
+                        );
+                        let fname =
+                            format!("{}_result{}_diamond_{}x{}.pgm", img_path, n_val, size, size);
                         write_pgm(&fname, size, size, &pixels);
                         eprintln!("    Saved {}", fname);
                     }
@@ -2346,7 +2878,11 @@ fn main() {
                 }
 
                 let num = decode_scott_num(&mut arena, val, 1_000_000);
-                let b = if num.is_none() { decode_bool(&mut arena, val, 500_000) } else { None };
+                let b = if num.is_none() {
+                    decode_bool(&mut arena, val, 500_000)
+                } else {
+                    None
+                };
                 let tag = arena.nodes[arena.follow(val) as usize].tag;
                 if let Some(n_val) = num {
                     eprint!("N={:3}: num={:<5}  ", n, n_val);
@@ -2355,7 +2891,9 @@ fn main() {
                 } else {
                     eprint!("N={:3}: FAIL t={}  ", n, tag);
                 }
-                if n % 4 == 0 { eprintln!(); }
+                if n % 4 == 0 {
+                    eprintln!();
+                }
             }
             eprintln!();
         }
@@ -2378,7 +2916,10 @@ fn main() {
                 if arena.nodes[r as usize].tag == 100 {
                     eprintln!("  [OK] true(x)(y) = x");
                 } else {
-                    eprintln!("  [FAIL] true(x)(y) = tag {}, expected 100", arena.nodes[r as usize].tag);
+                    eprintln!(
+                        "  [FAIL] true(x)(y) = tag {}, expected 100",
+                        arena.nodes[r as usize].tag
+                    );
                     ok = false;
                 }
             }
@@ -2396,7 +2937,10 @@ fn main() {
                 if arena.nodes[r as usize].tag == 101 {
                     eprintln!("  [OK] false(x)(y) = y");
                 } else {
-                    eprintln!("  [FAIL] false(x)(y) = tag {}, expected 101", arena.nodes[r as usize].tag);
+                    eprintln!(
+                        "  [FAIL] false(x)(y) = tag {}, expected 101",
+                        arena.nodes[r as usize].tag
+                    );
                     ok = false;
                 }
             }
@@ -2411,7 +2955,10 @@ fn main() {
                 if arena.nodes[fst as usize].tag == 100 {
                     eprintln!("  [OK] fst(pair(a,b)) = a");
                 } else {
-                    eprintln!("  [FAIL] fst(pair(a,b)) = tag {}, expected 100", arena.nodes[fst as usize].tag);
+                    eprintln!(
+                        "  [FAIL] fst(pair(a,b)) = tag {}, expected 100",
+                        arena.nodes[fst as usize].tag
+                    );
                     ok = false;
                 }
             }
@@ -2426,7 +2973,10 @@ fn main() {
                 if arena.nodes[snd as usize].tag == 101 {
                     eprintln!("  [OK] snd(pair(a,b)) = b");
                 } else {
-                    eprintln!("  [FAIL] snd(pair(a,b)) = tag {}, expected 101", arena.nodes[snd as usize].tag);
+                    eprintln!(
+                        "  [FAIL] snd(pair(a,b)) = tag {}, expected 101",
+                        arena.nodes[snd as usize].tag
+                    );
                     ok = false;
                 }
             }
@@ -2462,12 +3012,15 @@ fn main() {
                     eprint!("  [FAIL] num({})={:?} ", n, decoded);
                     ok = false;
                 }
-                if (n + 1) % 8 == 0 { eprintln!(); }
+                if (n + 1) % 8 == 0 {
+                    eprintln!();
+                }
             }
 
             // Test 7: Verify number 3 compact matches server-verified encoding
             {
-                let expected = "kXX--kkD-XkXX--D----XkXX--kkD-XkXX--D----XkXX--kkD-XXD----XXD----------";
+                let expected =
+                    "kXX--kkD-XkXX--D----XkXX--kkD-XkXX--D----XkXX--kkD-XXD----XXD----------";
                 let n3_from_compact = parse_compact(&mut arena, expected.as_bytes());
                 let dec = decode_scott_num(&mut arena, n3_from_compact, test_fuel);
                 if dec == Some(3) {
@@ -2523,7 +3076,14 @@ fn main() {
 
                 // Describe head
                 let desc = describe(&arena, head, 0);
-                eprintln!("  head = {}", if desc.len() > 300 { &desc[..300] } else { &desc });
+                eprintln!(
+                    "  head = {}",
+                    if desc.len() > 300 {
+                        &desc[..300]
+                    } else {
+                        &desc
+                    }
+                );
 
                 // Try decode head as various types
                 if let Some(b) = decode_bool(&mut arena, head, f.min(1_000_000)) {
@@ -2535,9 +3095,17 @@ fn main() {
                     let h_fst = pair1_fst(&mut arena, head, &mut f);
                     let h_snd = pair1_snd(&mut arena, head, &mut f);
                     let hf_bool = decode_bool(&mut arena, h_fst, f.min(500_000));
-                    let hf_num = if hf_bool.is_none() { decode_scott_num(&mut arena, h_fst, f.min(500_000)) } else { None };
+                    let hf_num = if hf_bool.is_none() {
+                        decode_scott_num(&mut arena, h_fst, f.min(500_000))
+                    } else {
+                        None
+                    };
                     let hs_bool = decode_bool(&mut arena, h_snd, f.min(500_000));
-                    let hs_num = if hs_bool.is_none() { decode_scott_num(&mut arena, h_snd, f.min(500_000)) } else { None };
+                    let hs_num = if hs_bool.is_none() {
+                        decode_scott_num(&mut arena, h_snd, f.min(500_000))
+                    } else {
+                        None
+                    };
                     eprintln!("  head.fst = bool={:?} num={:?}", hf_bool, hf_num);
                     eprintln!("  head.snd = bool={:?} num={:?}", hs_bool, hs_num);
 
@@ -2556,7 +3124,8 @@ fn main() {
                         // That's wrong. We need Church-style extractors.
 
                         // Simpler: just apply head to 5 unique markers and see what comes out
-                        let markers: Vec<u32> = (0..5).map(|j| arena.alloc(110 + j, NIL, NIL)).collect();
+                        let markers: Vec<u32> =
+                            (0..5).map(|j| arena.alloc(110 + j, NIL, NIL)).collect();
                         let mut app = arena.alloc(APP, head, markers[0]);
                         for &m in &markers[1..] {
                             app = arena.alloc(APP, app, m);
@@ -2566,7 +3135,11 @@ fn main() {
                         let r = arena.follow(app);
                         let tag = arena.nodes[r as usize].tag;
                         let r_desc = describe(&arena, r, 0);
-                        let rd = if r_desc.len() > 100 { &r_desc[..100] } else { &r_desc };
+                        let rd = if r_desc.len() > 100 {
+                            &r_desc[..100]
+                        } else {
+                            &r_desc
+                        };
                         eprintln!("    head(m0)(m1)(m2)(m3)(m4) tag={} = {}", tag, rd);
                         break; // only need to test once
                     }
@@ -2588,7 +3161,11 @@ fn main() {
                         let hh = pair1_fst(&mut arena, hcur, &mut f);
                         let ht = pair1_snd(&mut arena, hcur, &mut f);
                         let hh_b = decode_bool(&mut arena, hh, f.min(500_000));
-                        let hh_n = if hh_b.is_none() { decode_scott_num(&mut arena, hh, f.min(500_000)) } else { None };
+                        let hh_n = if hh_b.is_none() {
+                            decode_scott_num(&mut arena, hh, f.min(500_000))
+                        } else {
+                            None
+                        };
                         eprintln!("    [{}] fst=bool={:?} num={:?}", j, hh_b, hh_n);
                         hcur = ht;
                     }
@@ -2655,22 +3232,43 @@ fn main() {
                     }
                 }
                 if (m + 1) % 4 == 0 {
-                    eprint!("\r  row {}/{} ({} num, {} bool, {} fail)     ", m + 1, size, num_count, bool_count, fail_count);
+                    eprint!(
+                        "\r  row {}/{} ({} num, {} bool, {} fail)     ",
+                        m + 1,
+                        size,
+                        num_count,
+                        bool_count,
+                        fail_count
+                    );
                 }
             }
             eprintln!();
-            eprintln!("  Decoded: {} num, {} bool, {} fail", num_count, bool_count, fail_count);
+            eprintln!(
+                "  Decoded: {} num, {} bool, {} fail",
+                num_count, bool_count, fail_count
+            );
 
-            let max_val = pixels.iter().copied().filter(|&p| p != 128).max().unwrap_or(1);
+            let max_val = pixels
+                .iter()
+                .copied()
+                .filter(|&p| p != 128)
+                .max()
+                .unwrap_or(1);
             let fname = format!("{}_item_{}x{}.pgm", img_path, size, size);
             write_pgm(&fname, size as usize, size as usize, &pixels);
             eprintln!("  Saved {}", fname);
 
             if max_val > 1 && max_val < 255 {
-                let normalized: Vec<u8> = pixels.iter().map(|&p| {
-                    if p == 128 { 128 }
-                    else { ((p as u32) * 255 / max_val as u32).min(255) as u8 }
-                }).collect();
+                let normalized: Vec<u8> = pixels
+                    .iter()
+                    .map(|&p| {
+                        if p == 128 {
+                            128
+                        } else {
+                            ((p as u32) * 255 / max_val as u32).min(255) as u8
+                        }
+                    })
+                    .collect();
                 let fname2 = format!("{}_item_norm_{}x{}.pgm", img_path, size, size);
                 write_pgm(&fname2, size as usize, size as usize, &normalized);
                 eprintln!("  Saved {}", fname2);
@@ -2699,11 +3297,19 @@ fn main() {
                     arena.whnf(app2, &mut pf);
                     let r = arena.follow(app2);
                     let num = decode_scott_num(&mut arena, r, 1_000_000);
-                    let b = if num.is_none() { decode_bool(&mut arena, r, 500_000) } else { None };
+                    let b = if num.is_none() {
+                        decode_bool(&mut arena, r, 500_000)
+                    } else {
+                        None
+                    };
                     eprint!("  ({},{})=", m, z);
-                    if let Some(n) = num { eprint!("N{} ", n); }
-                    else if let Some(b) = b { eprint!("B{} ", b as u8); }
-                    else { eprint!("?? "); }
+                    if let Some(n) = num {
+                        eprint!("N{} ", n);
+                    } else if let Some(b) = b {
+                        eprint!("B{} ", b as u8);
+                    } else {
+                        eprint!("?? ");
+                    }
                 }
                 eprintln!();
             }
@@ -2718,7 +3324,10 @@ fn main() {
                 render_diamond(&mut arena, item, &mut pix, 0, 0, sz, sz, &mut rf, &mut pc);
                 let black = pix.iter().filter(|&&p| p == 0).count();
                 let white = pix.iter().filter(|&&p| p == 255).count();
-                eprintln!("  {}x{}: {} rendered, black={}, white={}", sz, sz, pc, black, white);
+                eprintln!(
+                    "  {}x{}: {} rendered, black={}, white={}",
+                    sz, sz, pc, black, white
+                );
                 let fname = format!("{}_item_diamond_{}x{}.pgm", img_path, sz, sz);
                 write_pgm(&fname, sz, sz, &pix);
             }
@@ -2741,48 +3350,60 @@ fn main() {
                 let mut tf1 = 1000000u64;
                 let snd1 = pair_snd(&mut arena, list1, &mut tf1);
                 let snd1_bool = decode_bool(&mut arena, snd1, 1000000);
-                eprintln!("SELFTEST pair2: pair_snd(cons(nil, true)) = {:?} (expected Some(true))", snd1_bool);
+                eprintln!(
+                    "SELFTEST pair2: pair_snd(cons(nil, true)) = {:?} (expected Some(true))",
+                    snd1_bool
+                );
                 // pair_fst(list1) should be nil
                 let mut tf2 = 1000000u64;
                 let fst1 = pair_fst(&mut arena, list1, &mut tf2);
                 let fst1_bool = decode_bool(&mut arena, fst1, 1000000);
-                eprintln!("SELFTEST pair2: pair_fst(cons(nil, true)) = {:?} (expected Some(false))", fst1_bool);
+                eprintln!(
+                    "SELFTEST pair2: pair_fst(cons(nil, true)) = {:?} (expected Some(false))",
+                    fst1_bool
+                );
                 // Build cons(list1, false) = pair2(list1, false_node)
                 let false2 = make_false(&mut arena);
                 let list2 = make_pair(&mut arena, list1, false2);
                 let mut tf3 = 1000000u64;
                 let snd2 = pair_snd(&mut arena, list2, &mut tf3);
                 let snd2_bool = decode_bool(&mut arena, snd2, 1000000);
-                eprintln!("SELFTEST pair2: pair_snd(cons(list1, false)) = {:?} (expected Some(false))", snd2_bool);
+                eprintln!(
+                    "SELFTEST pair2: pair_snd(cons(list1, false)) = {:?} (expected Some(false))",
+                    snd2_bool
+                );
                 let mut tf4 = 1000000u64;
                 let fst2 = pair_fst(&mut arena, list2, &mut tf4);
                 // fst2 should be list1; extracting snd from it should give true
                 let mut tf5 = 1000000u64;
                 let fst2_snd = pair_snd(&mut arena, fst2, &mut tf5);
                 let fst2_snd_bool = decode_bool(&mut arena, fst2_snd, 1000000);
-                eprintln!("SELFTEST pair2: pair_snd(pair_fst(list2)) = {:?} (expected Some(true))", fst2_snd_bool);
+                eprintln!(
+                    "SELFTEST pair2: pair_snd(pair_fst(list2)) = {:?} (expected Some(true))",
+                    fst2_snd_bool
+                );
             }
 
             // SELFTEST: diamond (Church 5-tuple) selectors
             {
-                let t = make_true(&mut arena);  // S(KK)I
-                let f = make_false(&mut arena);  // KI
-                // Build 5-tuple: (true, false, true, false, true)
-                // Church 5-tuple: λh. h(a)(b)(c)(d)(e)
-                // = S(S(S(S(SI)(Ka))(Kb))(Kc))(Kd))(Ke)
+                let t = make_true(&mut arena); // S(KK)I
+                let f = make_false(&mut arena); // KI
+                                                // Build 5-tuple: (true, false, true, false, true)
+                                                // Church 5-tuple: λh. h(a)(b)(c)(d)(e)
+                                                // = S(S(S(S(SI)(Ka))(Kb))(Kc))(Kd))(Ke)
                 let i_n = arena.alloc(I, NIL, NIL);
                 let k_n = arena.alloc(K, NIL, NIL);
                 // Build S(I)(K(a)) step by step
-                let ka = arena.alloc(K1, t, NIL);  // K(true)
-                let si = arena.alloc(S1, i_n, NIL);  // S(I)
-                let si_ka = arena.alloc(S2, i_n, ka);  // S(I)(K(true))
-                let kb = arena.alloc(K1, f, NIL);  // K(false)
+                let ka = arena.alloc(K1, t, NIL); // K(true)
+                let si = arena.alloc(S1, i_n, NIL); // S(I)
+                let si_ka = arena.alloc(S2, i_n, ka); // S(I)(K(true))
+                let kb = arena.alloc(K1, f, NIL); // K(false)
                 let s_sika_kb = arena.alloc(S2, si_ka, kb); // S(S(I)(K(true)))(K(false))
-                let kc = arena.alloc(K1, t, NIL);  // K(true)
+                let kc = arena.alloc(K1, t, NIL); // K(true)
                 let s2 = arena.alloc(S2, s_sika_kb, kc); // S(S(S(I)(Ka))(Kb))(Kc)
-                let kd = arena.alloc(K1, f, NIL);  // K(false)
+                let kd = arena.alloc(K1, f, NIL); // K(false)
                 let s3 = arena.alloc(S2, s2, kd); // S(S(S(S(I)(Ka))(Kb))(Kc))(Kd)
-                let ke = arena.alloc(K1, t, NIL);  // K(true)
+                let ke = arena.alloc(K1, t, NIL); // K(true)
                 let tuple5 = arena.alloc(S2, s3, ke); // The 5-tuple
 
                 for i in 0..5 {
@@ -2792,8 +3413,15 @@ fn main() {
                     arena.whnf(app, &mut sf);
                     let r = arena.follow(app);
                     let b = decode_bool(&mut arena, r, 500000);
-                    let expected = if i % 2 == 0 { "Some(true)" } else { "Some(false)" };
-                    eprintln!("SELFTEST diamond sel_{}: {:?} (expected {})", i, b, expected);
+                    let expected = if i % 2 == 0 {
+                        "Some(true)"
+                    } else {
+                        "Some(false)"
+                    };
+                    eprintln!(
+                        "SELFTEST diamond sel_{}: {:?} (expected {})",
+                        i, b, expected
+                    );
                 }
             }
 
@@ -2847,7 +3475,11 @@ fn main() {
                         // pair_fst = bit, pair_snd = rest_bits (same as decode_scott_num)
                         // Skip string scanning for image output (p2=2) to avoid OOM
                         // Try BOTH conventions for string list scan
-                        for conv in if p2 == Some(2) { vec![] } else { vec!["B_fst_val", "A_fst_rest"] } {
+                        for conv in if p2 == Some(2) {
+                            vec![]
+                        } else {
+                            vec!["B_fst_val", "A_fst_rest"]
+                        } {
                             let mut wd = data;
                             let mut total = 0u32;
                             let mut chars_a: Vec<Option<u64>> = Vec::new();
@@ -2855,7 +3487,10 @@ fn main() {
                             for _i in 0..200u32 {
                                 let is_nil = decode_bool(&mut arena, wd, fuel_per_step);
                                 if is_nil == Some(false) {
-                                    eprintln!("  [{}] terminated at nil after {} elements", conv, total);
+                                    eprintln!(
+                                        "  [{}] terminated at nil after {} elements",
+                                        conv, total
+                                    );
                                     break;
                                 }
                                 total += 1;
@@ -2878,7 +3513,14 @@ fn main() {
                                 let intval = decode_integer(&mut arena, w_val, fuel_per_step);
                                 if total <= 40 {
                                     let vd = describe(&arena, w_val, 0);
-                                    eprintln!("  [{}] elem[{}]: scott={:?} int={:?} val={}", conv, total-1, scott, intval, &vd[..120.min(vd.len())]);
+                                    eprintln!(
+                                        "  [{}] elem[{}]: scott={:?} int={:?} val={}",
+                                        conv,
+                                        total - 1,
+                                        scott,
+                                        intval,
+                                        &vd[..120.min(vd.len())]
+                                    );
                                 }
                                 chars_a.push(scott);
                                 chars_int.push(intval);
@@ -2886,27 +3528,41 @@ fn main() {
                             }
                             eprintln!("  [{}] total: {} elements", conv, total);
                             // Show values
-                            let vals: Vec<String> = chars_a.iter().zip(chars_int.iter()).map(|(s, i)| {
-                                match (s, i) {
+                            let vals: Vec<String> = chars_a
+                                .iter()
+                                .zip(chars_int.iter())
+                                .map(|(s, i)| match (s, i) {
                                     (Some(n), _) => format!("{}", n),
                                     (_, Some(n)) => format!("i{}", n),
                                     _ => "?".to_string(),
-                                }
-                            }).collect();
+                                })
+                                .collect();
                             eprintln!("  [{}] values: {}", conv, vals.join(","));
                             // Try to build string from integer values
                             let mut str_chars: Vec<char> = Vec::new();
                             for i in &chars_int {
                                 match i {
-                                    Some(n) if *n >= 32 && *n < 127 => str_chars.push(*n as u8 as char),
-                                    Some(n) if *n >= 0 && *n < 0x110000 => str_chars.push(char::from_u32(*n as u32).unwrap_or('?')),
+                                    Some(n) if *n >= 32 && *n < 127 => {
+                                        str_chars.push(*n as u8 as char)
+                                    }
+                                    Some(n) if *n >= 0 && *n < 0x110000 => {
+                                        str_chars.push(char::from_u32(*n as u32).unwrap_or('?'))
+                                    }
                                     _ => str_chars.push('?'),
                                 }
                             }
                             let as_is: String = str_chars.iter().collect();
                             let reversed: String = str_chars.iter().rev().collect();
-                            eprintln!("  [{}] as string (outer-first): {:?}", conv, &as_is[..200.min(as_is.len())]);
-                            eprintln!("  [{}] as string (reversed): {:?}", conv, &reversed[..200.min(reversed.len())]);
+                            eprintln!(
+                                "  [{}] as string (outer-first): {:?}",
+                                conv,
+                                &as_is[..200.min(as_is.len())]
+                            );
+                            eprintln!(
+                                "  [{}] as string (reversed): {:?}",
+                                conv,
+                                &reversed[..200.min(reversed.len())]
+                            );
                         }
 
                         match p2 {
@@ -2945,9 +3601,14 @@ fn main() {
                                 let eval_fuel: u64 = 500_000_000;
 
                                 // Helper: extract i-th child (1=TL, 2=TR, 3=BL, 4=BR)
-                                fn get_child_fn(arena: &mut Arena, parent: u32, child_idx: usize,
-                                    sels: &[u32; 5], cache: &mut HashMap<u32, [u32; 4]>, fuel: u64) -> u32
-                                {
+                                fn get_child_fn(
+                                    arena: &mut Arena,
+                                    parent: u32,
+                                    child_idx: usize,
+                                    sels: &[u32; 5],
+                                    cache: &mut HashMap<u32, [u32; 4]>,
+                                    fuel: u64,
+                                ) -> u32 {
                                     let p = arena.follow(parent);
                                     if let Some(children) = cache.get(&p) {
                                         return children[child_idx - 1];
@@ -2964,11 +3625,17 @@ fn main() {
                                 }
 
                                 // Helper: get bool_b of a node
-                                fn get_bool_fn(arena: &mut Arena, node: u32, sels: &[u32; 5],
-                                    cache: &mut HashMap<u32, Option<bool>>, fuel: u64) -> Option<bool>
-                                {
+                                fn get_bool_fn(
+                                    arena: &mut Arena,
+                                    node: u32,
+                                    sels: &[u32; 5],
+                                    cache: &mut HashMap<u32, Option<bool>>,
+                                    fuel: u64,
+                                ) -> Option<bool> {
                                     let n = arena.follow(node);
-                                    if let Some(&b) = cache.get(&n) { return b; }
+                                    if let Some(&b) = cache.get(&n) {
+                                        return b;
+                                    }
                                     let app = arena.alloc(APP, n, sels[0]);
                                     let mut f = fuel;
                                     arena.whnf(app, &mut f);
@@ -2985,11 +3652,42 @@ fn main() {
 
                                 // We track 4 quadrant roots for the current "virtual root"
                                 // For depth <= 8, we have a single root; for zoom we have 4 sub-roots
-                                let root_tl = get_child_fn(&mut arena, data, 1, &sels, &mut child_cache, eval_fuel);
-                                let root_tr = get_child_fn(&mut arena, data, 2, &sels, &mut child_cache, eval_fuel);
-                                let root_bl = get_child_fn(&mut arena, data, 3, &sels, &mut child_cache, eval_fuel);
-                                let root_br = get_child_fn(&mut arena, data, 4, &sels, &mut child_cache, eval_fuel);
-                                eprintln!("  Root children extracted. Arena: {}", arena.nodes.len());
+                                let root_tl = get_child_fn(
+                                    &mut arena,
+                                    data,
+                                    1,
+                                    &sels,
+                                    &mut child_cache,
+                                    eval_fuel,
+                                );
+                                let root_tr = get_child_fn(
+                                    &mut arena,
+                                    data,
+                                    2,
+                                    &sels,
+                                    &mut child_cache,
+                                    eval_fuel,
+                                );
+                                let root_bl = get_child_fn(
+                                    &mut arena,
+                                    data,
+                                    3,
+                                    &sels,
+                                    &mut child_cache,
+                                    eval_fuel,
+                                );
+                                let root_br = get_child_fn(
+                                    &mut arena,
+                                    data,
+                                    4,
+                                    &sels,
+                                    &mut child_cache,
+                                    eval_fuel,
+                                );
+                                eprintln!(
+                                    "  Root children extracted. Arena: {}",
+                                    arena.nodes.len()
+                                );
 
                                 // Pixel-by-pixel renderer using checkpoint/restore.
                                 // For each pixel, navigate from sub_roots to the leaf, extract bool_b,
@@ -3001,14 +3699,16 @@ fn main() {
                                 fn render_shared(
                                     arena: &mut Arena,
                                     sub_roots: [u32; 4], // [TL, TR, BL, BR]
-                                    size: usize,          // output image size (must be power of 2, >= 2)
+                                    size: usize, // output image size (must be power of 2, >= 2)
                                     sels: &[u32; 5],
                                     fuel_per_pixel: u64,
                                     gc_extra_roots: &[u32],
                                     gc_threshold: usize,
                                 ) -> Vec<u8> {
                                     let half = size / 2;
-                                    let depth_within = if half <= 1 { 0 } else {
+                                    let depth_within = if half <= 1 {
+                                        0
+                                    } else {
                                         (half as f64).log2() as usize
                                     };
                                     let mut pixels = vec![0u8; size * size];
@@ -3019,30 +3719,55 @@ fn main() {
                                     for row in 0..size {
                                         for col in 0..size {
                                             let qi = if row < half {
-                                                if col < half { 0 } else { 1 }
+                                                if col < half {
+                                                    0
+                                                } else {
+                                                    1
+                                                }
                                             } else {
-                                                if col < half { 2 } else { 3 }
+                                                if col < half {
+                                                    2
+                                                } else {
+                                                    3
+                                                }
                                             };
                                             let mut node = sub_roots[qi];
-                                            let mut local_row = if row < half { row } else { row - half };
-                                            let mut local_col = if col < half { col } else { col - half };
+                                            let mut local_row =
+                                                if row < half { row } else { row - half };
+                                            let mut local_col =
+                                                if col < half { col } else { col - half };
                                             let mut local_size = half;
 
                                             let mut ok = true;
                                             for _level in 0..depth_within {
                                                 let lh = local_size / 2;
                                                 let child_idx = if local_row < lh {
-                                                    if local_col < lh { 1 } else { 2 }
+                                                    if local_col < lh {
+                                                        1
+                                                    } else {
+                                                        2
+                                                    }
                                                 } else {
-                                                    if local_col < lh { 3 } else { 4 }
+                                                    if local_col < lh {
+                                                        3
+                                                    } else {
+                                                        4
+                                                    }
                                                 };
                                                 let app = arena.alloc(APP, node, sels[child_idx]);
                                                 let mut f = fuel_per_pixel;
                                                 arena.whnf(app, &mut f);
-                                                if f == 0 { ok = false; break; }
+                                                if f == 0 {
+                                                    ok = false;
+                                                    break;
+                                                }
                                                 node = arena.follow(app);
-                                                if local_row >= lh { local_row -= lh; }
-                                                if local_col >= lh { local_col -= lh; }
+                                                if local_row >= lh {
+                                                    local_row -= lh;
+                                                }
+                                                if local_col >= lh {
+                                                    local_col -= lh;
+                                                }
                                                 local_size = lh;
                                             }
 
@@ -3060,7 +3785,9 @@ fn main() {
                                                         None => 128u8,
                                                     }
                                                 }
-                                            } else { 128u8 };
+                                            } else {
+                                                128u8
+                                            };
 
                                             pixels[row * size + col] = pixel_val;
                                             match pixel_val {
@@ -3070,17 +3797,35 @@ fn main() {
                                             }
                                         }
                                         if (row + 1) % 8 == 0 || row == size - 1 {
-                                            eprintln!("      Row {}/{}: B={} W={} G={} arena={} free={}",
-                                                row + 1, size, black, white, gray, arena.nodes.len(), arena.free_list.len());
+                                            eprintln!(
+                                                "      Row {}/{}: B={} W={} G={} arena={} free={}",
+                                                row + 1,
+                                                size,
+                                                black,
+                                                white,
+                                                gray,
+                                                arena.nodes.len(),
+                                                arena.free_list.len()
+                                            );
                                         }
                                         // GC when free list runs low (every row check)
                                         if arena.free_list.len() < 10_000_000 {
                                             let mut roots: Vec<u32> = Vec::new();
-                                            for &s in sels { roots.push(s); }
-                                            for &r in &sub_roots { roots.push(r); }
+                                            for &s in sels {
+                                                roots.push(s);
+                                            }
+                                            for &r in &sub_roots {
+                                                roots.push(r);
+                                            }
                                             roots.extend_from_slice(gc_extra_roots);
                                             let (total, live, freed) = arena.gc(&roots);
-                                            eprintln!("      GC: total={}, live={}, freed={}, free={}", total, live, freed, arena.free_list.len());
+                                            eprintln!(
+                                                "      GC: total={}, live={}, freed={}, free={}",
+                                                total,
+                                                live,
+                                                freed,
+                                                arena.free_list.len()
+                                            );
                                         }
                                     }
                                     pixels
@@ -3096,27 +3841,41 @@ fn main() {
                                 ) {
                                     let mut roots: Vec<u32> = Vec::new();
                                     // Selectors
-                                    for &s in sels { roots.push(s); }
+                                    for &s in sels {
+                                        roots.push(s);
+                                    }
                                     // Extra roots (zoom nodes, data, etc)
                                     roots.extend_from_slice(extra_roots);
                                     // All cached child nodes (both keys and values)
                                     for (&parent, children) in child_cache.iter() {
                                         roots.push(parent);
-                                        for &c in children { roots.push(c); }
+                                        for &c in children {
+                                            roots.push(c);
+                                        }
                                     }
                                     // All cached bool keys
                                     for &node in bool_cache.keys() {
                                         roots.push(node);
                                     }
                                     let (total, live, freed) = arena.gc(&roots);
-                                    eprintln!("  GC: total={}, live={}, freed={}, free_list={}",
-                                        total, live, freed, arena.free_list.len());
+                                    eprintln!(
+                                        "  GC: total={}, live={}, freed={}, free_list={}",
+                                        total,
+                                        live,
+                                        freed,
+                                        arena.free_list.len()
+                                    );
                                 }
 
                                 // Run GC before rendering to reclaim I/O processing garbage
                                 eprintln!("  Running initial GC...");
-                                do_gc(&mut arena, &sels, &[data, root_tl, root_tr, root_bl, root_br],
-                                    &mut child_cache, &mut bool_cache);
+                                do_gc(
+                                    &mut arena,
+                                    &sels,
+                                    &[data, root_tl, root_tr, root_bl, root_br],
+                                    &mut child_cache,
+                                    &mut bool_cache,
+                                );
 
                                 // Phase 1: SKIPPED (all depths 1-8 are all-black)
                                 eprintln!("  Phase 1: SKIPPED (depths 1-8 are all-black)");
@@ -3130,12 +3889,48 @@ fn main() {
 
                                 // Do zoom steps 1-8 first (without rendering, just navigate to center)
                                 for step in 1..=7 {
-                                    let new_tl = get_child_fn(&mut arena, zoom_tl, 4, &sels, &mut child_cache, eval_fuel);
-                                    let new_tr = get_child_fn(&mut arena, zoom_tr, 3, &sels, &mut child_cache, eval_fuel);
-                                    let new_bl = get_child_fn(&mut arena, zoom_bl, 2, &sels, &mut child_cache, eval_fuel);
-                                    let new_br = get_child_fn(&mut arena, zoom_br, 1, &sels, &mut child_cache, eval_fuel);
-                                    zoom_tl = new_tl; zoom_tr = new_tr; zoom_bl = new_bl; zoom_br = new_br;
-                                    eprintln!("    Zoom step {}: arena={} free={}", step, arena.nodes.len(), arena.free_list.len());
+                                    let new_tl = get_child_fn(
+                                        &mut arena,
+                                        zoom_tl,
+                                        4,
+                                        &sels,
+                                        &mut child_cache,
+                                        eval_fuel,
+                                    );
+                                    let new_tr = get_child_fn(
+                                        &mut arena,
+                                        zoom_tr,
+                                        3,
+                                        &sels,
+                                        &mut child_cache,
+                                        eval_fuel,
+                                    );
+                                    let new_bl = get_child_fn(
+                                        &mut arena,
+                                        zoom_bl,
+                                        2,
+                                        &sels,
+                                        &mut child_cache,
+                                        eval_fuel,
+                                    );
+                                    let new_br = get_child_fn(
+                                        &mut arena,
+                                        zoom_br,
+                                        1,
+                                        &sels,
+                                        &mut child_cache,
+                                        eval_fuel,
+                                    );
+                                    zoom_tl = new_tl;
+                                    zoom_tr = new_tr;
+                                    zoom_bl = new_bl;
+                                    zoom_br = new_br;
+                                    eprintln!(
+                                        "    Zoom step {}: arena={} free={}",
+                                        step,
+                                        arena.nodes.len(),
+                                        arena.free_list.len()
+                                    );
                                 }
 
                                 // KEY OPTIMIZATION: Clear caches and GC aggressively.
@@ -3146,50 +3941,124 @@ fn main() {
                                 bool_cache.clear();
                                 {
                                     let mut roots: Vec<u32> = Vec::new();
-                                    for &s in &sels { roots.push(s); }
+                                    for &s in &sels {
+                                        roots.push(s);
+                                    }
                                     roots.extend_from_slice(&[zoom_tl, zoom_tr, zoom_bl, zoom_br]);
                                     let (total, live, freed) = arena.gc(&roots);
-                                    eprintln!("  Aggressive GC: total={}, live={}, freed={}, free={}",
-                                        total, live, freed, arena.free_list.len());
+                                    eprintln!(
+                                        "  Aggressive GC: total={}, live={}, freed={}, free={}",
+                                        total,
+                                        live,
+                                        freed,
+                                        arena.free_list.len()
+                                    );
                                 }
 
                                 // Now zoom_tl/tr/bl/br represent the center of depth 8
                                 // Continue zooming for depths 9-25, rendering at each depth
                                 for depth in 9..=max_depth {
                                     // Zoom step: extract center children
-                                    let new_tl = get_child_fn(&mut arena, zoom_tl, 4, &sels, &mut child_cache, eval_fuel);
-                                    let new_tr = get_child_fn(&mut arena, zoom_tr, 3, &sels, &mut child_cache, eval_fuel);
-                                    let new_bl = get_child_fn(&mut arena, zoom_bl, 2, &sels, &mut child_cache, eval_fuel);
-                                    let new_br = get_child_fn(&mut arena, zoom_br, 1, &sels, &mut child_cache, eval_fuel);
-                                    zoom_tl = new_tl; zoom_tr = new_tr; zoom_bl = new_bl; zoom_br = new_br;
-                                    eprintln!("    Zoom to depth {}: arena={} free={}",
-                                        depth, arena.nodes.len(), arena.free_list.len());
+                                    let new_tl = get_child_fn(
+                                        &mut arena,
+                                        zoom_tl,
+                                        4,
+                                        &sels,
+                                        &mut child_cache,
+                                        eval_fuel,
+                                    );
+                                    let new_tr = get_child_fn(
+                                        &mut arena,
+                                        zoom_tr,
+                                        3,
+                                        &sels,
+                                        &mut child_cache,
+                                        eval_fuel,
+                                    );
+                                    let new_bl = get_child_fn(
+                                        &mut arena,
+                                        zoom_bl,
+                                        2,
+                                        &sels,
+                                        &mut child_cache,
+                                        eval_fuel,
+                                    );
+                                    let new_br = get_child_fn(
+                                        &mut arena,
+                                        zoom_br,
+                                        1,
+                                        &sels,
+                                        &mut child_cache,
+                                        eval_fuel,
+                                    );
+                                    zoom_tl = new_tl;
+                                    zoom_tr = new_tr;
+                                    zoom_bl = new_bl;
+                                    zoom_br = new_br;
+                                    eprintln!(
+                                        "    Zoom to depth {}: arena={} free={}",
+                                        depth,
+                                        arena.nodes.len(),
+                                        arena.free_list.len()
+                                    );
 
                                     // GC after zoom step (before probe/render) — clears intermediate garbage
                                     child_cache.clear();
                                     bool_cache.clear();
                                     {
                                         let mut roots: Vec<u32> = Vec::new();
-                                        for &s in &sels { roots.push(s); }
-                                        roots.extend_from_slice(&[zoom_tl, zoom_tr, zoom_bl, zoom_br]);
+                                        for &s in &sels {
+                                            roots.push(s);
+                                        }
+                                        roots.extend_from_slice(&[
+                                            zoom_tl, zoom_tr, zoom_bl, zoom_br,
+                                        ]);
                                         let (total, live, freed) = arena.gc(&roots);
                                         eprintln!("    Post-zoom GC: total={}, live={}, freed={}, free={}",
                                             total, live, freed, arena.free_list.len());
                                     }
 
                                     // Probe bool_b
-                                    let b_tl = get_bool_fn(&mut arena, zoom_tl, &sels, &mut bool_cache, eval_fuel);
-                                    let b_tr = get_bool_fn(&mut arena, zoom_tr, &sels, &mut bool_cache, eval_fuel);
-                                    let b_bl = get_bool_fn(&mut arena, zoom_bl, &sels, &mut bool_cache, eval_fuel);
-                                    let b_br = get_bool_fn(&mut arena, zoom_br, &sels, &mut bool_cache, eval_fuel);
+                                    let b_tl = get_bool_fn(
+                                        &mut arena,
+                                        zoom_tl,
+                                        &sels,
+                                        &mut bool_cache,
+                                        eval_fuel,
+                                    );
+                                    let b_tr = get_bool_fn(
+                                        &mut arena,
+                                        zoom_tr,
+                                        &sels,
+                                        &mut bool_cache,
+                                        eval_fuel,
+                                    );
+                                    let b_bl = get_bool_fn(
+                                        &mut arena,
+                                        zoom_bl,
+                                        &sels,
+                                        &mut bool_cache,
+                                        eval_fuel,
+                                    );
+                                    let b_br = get_bool_fn(
+                                        &mut arena,
+                                        zoom_br,
+                                        &sels,
+                                        &mut bool_cache,
+                                        eval_fuel,
+                                    );
                                     eprintln!("  Depth {} probe: TL={:?} TR={:?} BL={:?} BR={:?} arena={} free={}",
                                         depth, b_tl, b_tr, b_bl, b_br, arena.nodes.len(), arena.free_list.len());
 
                                     // GC after probe, before render
                                     {
                                         let mut roots: Vec<u32> = Vec::new();
-                                        for &s in &sels { roots.push(s); }
-                                        roots.extend_from_slice(&[zoom_tl, zoom_tr, zoom_bl, zoom_br]);
+                                        for &s in &sels {
+                                            roots.push(s);
+                                        }
+                                        roots.extend_from_slice(&[
+                                            zoom_tl, zoom_tr, zoom_bl, zoom_br,
+                                        ]);
                                         let (total, live, freed) = arena.gc(&roots);
                                         eprintln!("    Pre-render GC: total={}, live={}, freed={}, free={}",
                                             total, live, freed, arena.free_list.len());
@@ -3198,19 +4067,33 @@ fn main() {
                                     // Render using shared lazy evaluation
                                     // NOTE: `data` is NOT in gc_extra_roots — only zoom subtree is kept alive
                                     let render_sz: usize = 8;
-                                    eprintln!("  Rendering depth {} ({}x{} center zoom)...", depth, render_sz, render_sz);
+                                    eprintln!(
+                                        "  Rendering depth {} ({}x{} center zoom)...",
+                                        depth, render_sz, render_sz
+                                    );
                                     let pix = render_shared(
                                         &mut arena,
                                         [zoom_tl, zoom_tr, zoom_bl, zoom_br],
-                                        render_sz, &sels, eval_fuel,
+                                        render_sz,
+                                        &sels,
+                                        eval_fuel,
                                         &[zoom_tl, zoom_tr, zoom_bl, zoom_br],
-                                        1_000_000_000
+                                        1_000_000_000,
                                     );
                                     let bc = pix.iter().filter(|&&p| p == 0).count();
                                     let wc = pix.iter().filter(|&&p| p == 255).count();
                                     let gc_count = pix.iter().filter(|&&p| p == 128).count();
-                                    eprintln!("    black={}, white={}, gray={}, arena={}", bc, wc, gc_count, arena.nodes.len());
-                                    let fname = format!("{}_depth{}_{}x{}.pgm", img_path, depth, render_sz, render_sz);
+                                    eprintln!(
+                                        "    black={}, white={}, gray={}, arena={}",
+                                        bc,
+                                        wc,
+                                        gc_count,
+                                        arena.nodes.len()
+                                    );
+                                    let fname = format!(
+                                        "{}_depth{}_{}x{}.pgm",
+                                        img_path, depth, render_sz, render_sz
+                                    );
                                     write_pgm(&fname, render_sz, render_sz, &pix);
                                     eprintln!("    Saved: {}", fname);
 
@@ -3219,8 +4102,12 @@ fn main() {
                                     bool_cache.clear();
                                     {
                                         let mut roots: Vec<u32> = Vec::new();
-                                        for &s in &sels { roots.push(s); }
-                                        roots.extend_from_slice(&[zoom_tl, zoom_tr, zoom_bl, zoom_br]);
+                                        for &s in &sels {
+                                            roots.push(s);
+                                        }
+                                        roots.extend_from_slice(&[
+                                            zoom_tl, zoom_tr, zoom_bl, zoom_br,
+                                        ]);
                                         let (total, live, freed) = arena.gc(&roots);
                                         eprintln!("    Post-depth GC: total={}, live={}, freed={}, free={}",
                                             total, live, freed, arena.free_list.len());
@@ -3238,7 +4125,10 @@ fn main() {
                         // Input instruction
                         // Q = λx.continuation(x)
                         eprintln!("INPUT requested (p2={:?})", p2);
-                        eprintln!("  Q node: {}", &describe(&arena, q, 0)[..200.min(describe(&arena, q, 0).len())]);
+                        eprintln!(
+                            "  Q node: {}",
+                            &describe(&arena, q, 0)[..200.min(describe(&arena, q, 0).len())]
+                        );
 
                         let input_val = if !key_codes.is_empty() {
                             // Build key string from --key codes
@@ -3247,13 +4137,16 @@ fn main() {
                             // So: make_pair(char_code, rest)
                             eprintln!("  Using key codes: {:?}", key_codes);
                             let mut str_node = make_false(&mut arena); // nil
-                            // Push in reverse order so first char is outermost
-                            // (matches how the program stores strings)
+                                                                       // Push in reverse order so first char is outermost
+                                                                       // (matches how the program stores strings)
                             for &code in key_codes.iter().rev() {
                                 let ch_num = make_scott_num(&mut arena, code);
                                 str_node = make_pair(&mut arena, ch_num, str_node);
                             }
-                            eprintln!("  Built key string (B_fst_val reversed, {} chars)", key_codes.len());
+                            eprintln!(
+                                "  Built key string (B_fst_val reversed, {} chars)",
+                                key_codes.len()
+                            );
                             str_node
                         } else {
                             eprintln!("  No --key provided, using empty string");
@@ -3266,8 +4159,14 @@ fn main() {
                     }
                     None => {
                         eprintln!("Failed to decode p1 as Church number.");
-                        eprintln!("  Trying p1 as bool: {:?}", decode_bool(&mut arena, p1_node, fuel_per_step));
-                        eprintln!("  Trying p1 as Scott num: {:?}", decode_scott_num(&mut arena, p1_node, fuel_per_step));
+                        eprintln!(
+                            "  Trying p1 as bool: {:?}",
+                            decode_bool(&mut arena, p1_node, fuel_per_step)
+                        );
+                        eprintln!(
+                            "  Trying p1 as Scott num: {:?}",
+                            decode_scott_num(&mut arena, p1_node, fuel_per_step)
+                        );
 
                         // Try alternative: maybe it's NOT a 1-arg tuple.
                         // Maybe the encoding uses 2-arg pairs for tuples too?
@@ -3277,7 +4176,11 @@ fn main() {
                         let mut fb = fuel_per_step;
                         let p2_2arg = pair_snd(&mut arena, current, &mut fb);
                         eprintln!("  2-arg fst: {}", describe(&arena, p1_2arg, 0));
-                        eprintln!("  2-arg snd: {}", &describe(&arena, p2_2arg, 0)[..200.min(describe(&arena, p2_2arg, 0).len())]);
+                        eprintln!(
+                            "  2-arg snd: {}",
+                            &describe(&arena, p2_2arg, 0)
+                                [..200.min(describe(&arena, p2_2arg, 0).len())]
+                        );
 
                         // Try Church decode on 2-arg extracted values
                         let p1_alt = decode_church_num(&mut arena, p1_2arg, fuel_per_step);
@@ -3412,8 +4315,10 @@ fn main() {
                             // Decode the first char as Scott number
                             let char_val = decode_scott_num(&mut arena, first_elem, test_fuel / 10);
                             if pos == 0 && (test_char <= 3 || test_char == 5) {
-                                eprintln!("  char={}: p1={:?}, first_output_char={:?}, total_steps={}",
-                                    test_char, p1_val, char_val, total_steps);
+                                eprintln!(
+                                    "  char={}: p1={:?}, first_output_char={:?}, total_steps={}",
+                                    test_char, p1_val, char_val, total_steps
+                                );
                             }
                         }
 
@@ -3429,19 +4334,26 @@ fn main() {
                     results.sort_by(|a, b| b.1.cmp(&a.1));
                     eprintln!("Position {} results (top 5):", pos);
                     for (i, (ch, steps)) in results.iter().take(5).enumerate() {
-                        eprintln!("  #{}: char={} steps={}", i+1, ch, steps);
+                        eprintln!("  #{}: char={} steps={}", i + 1, ch, steps);
                     }
 
                     // Check if there's a clear winner (significantly more steps than second)
                     if results.len() >= 2 {
                         let top = results[0].1;
                         let second = results[1].1;
-                        let ratio = if second > 0 { top as f64 / second as f64 } else { 999.0 };
+                        let ratio = if second > 0 {
+                            top as f64 / second as f64
+                        } else {
+                            999.0
+                        };
                         eprintln!("  Top/second ratio: {:.3}", ratio);
 
                         if ratio < 1.01 {
                             // All characters take similar steps → key might be complete
-                            eprintln!("  No clear winner → key might be complete at length {}", pos);
+                            eprintln!(
+                                "  No clear winner → key might be complete at length {}",
+                                pos
+                            );
 
                             // Try the current key (without the test char) as the full key
                             // Check if it produces a non-error response
@@ -3492,7 +4404,10 @@ fn main() {
                     }
 
                     found_key.push(best_char);
-                    eprintln!("  Best char for position {}: {} (steps: {})", pos, best_char, best_steps);
+                    eprintln!(
+                        "  Best char for position {}: {} (steps: {})",
+                        pos, best_char, best_steps
+                    );
                     eprintln!("  Key so far: {:?}", found_key);
                 }
 
@@ -3571,14 +4486,22 @@ fn make_scott_num(arena: &mut Arena, n: u64) -> u32 {
 
 /// Recursively decode a pair structure.
 fn deep_decode(arena: &mut Arena, node: u32, fuel: u64, depth: usize, max_depth: usize) {
-    if depth > max_depth || fuel == 0 { return; }
+    if depth > max_depth || fuel == 0 {
+        return;
+    }
 
     let indent = "  ".repeat(depth);
 
     // Check if boolean
     match decode_bool(arena, node, fuel / 10) {
-        Some(true) => { println!("{}TRUE", indent); return; }
-        Some(false) => { println!("{}FALSE (nil)", indent); return; }
+        Some(true) => {
+            println!("{}TRUE", indent);
+            return;
+        }
+        Some(false) => {
+            println!("{}FALSE (nil)", indent);
+            return;
+        }
         None => {}
     }
 
@@ -3613,13 +4536,21 @@ fn collect_bool_leaves(
     leaves: &mut Vec<u8>,
     max_leaves: usize,
 ) {
-    if leaves.len() >= max_leaves || *fuel == 0 { return; }
+    if leaves.len() >= max_leaves || *fuel == 0 {
+        return;
+    }
 
     // Check if boolean leaf
     let b = decode_bool(arena, node, (*fuel).min(100000));
     match b {
-        Some(true) => { leaves.push(1); return; }
-        Some(false) => { leaves.push(0); return; }
+        Some(true) => {
+            leaves.push(1);
+            return;
+        }
+        Some(false) => {
+            leaves.push(0);
+            return;
+        }
         None => {}
     }
 
@@ -3627,7 +4558,9 @@ fn collect_bool_leaves(
     let fst = pair_fst(arena, node, fuel);
     collect_bool_leaves(arena, fst, fuel, leaves, max_leaves);
 
-    if leaves.len() >= max_leaves { return; }
+    if leaves.len() >= max_leaves {
+        return;
+    }
 
     let snd = pair_snd(arena, node, fuel);
     collect_bool_leaves(arena, snd, fuel, leaves, max_leaves);
@@ -3693,7 +4626,9 @@ fn decode_church_num(arena: &mut Arena, node: u32, fuel: u64) -> Option<u64> {
     let mut cur = arena.follow(app2);
     let mut count = 0u64;
     loop {
-        if f == 0 { return None; }
+        if f == 0 {
+            return None;
+        }
         let tag = arena.nodes[cur as usize].tag;
         if tag == 111 {
             return Some(count);
@@ -3737,7 +4672,9 @@ fn decode_integer(arena: &mut Arena, node: u32, fuel: u64) -> Option<i64> {
     let mut remaining = fuel;
 
     for _iter in 0..64 {
-        if remaining < fuel_per_op * 4 { break; }
+        if remaining < fuel_per_op * 4 {
+            break;
+        }
 
         // Check if current is nil (false/KI)
         let is_nil = decode_bool(arena, current, fuel_per_op);
@@ -3801,7 +4738,9 @@ fn decode_string(arena: &mut Arena, node: u32, fuel: u64) -> Option<String> {
     let mut remaining = fuel;
 
     for _ in 0..10000 {
-        if remaining < fuel_per_op * 6 { break; }
+        if remaining < fuel_per_op * 6 {
+            break;
+        }
 
         // Check if nil
         let is_nil = decode_bool(arena, current, fuel_per_op);
@@ -3821,7 +4760,11 @@ fn decode_string(arena: &mut Arena, node: u32, fuel: u64) -> Option<String> {
         // Decode char as integer — try Scott number first (the program's native encoding)
         if chars.len() < 5 {
             let desc = describe(arena, char_val, 0);
-            eprintln!("  char[{}] val node: {}", chars.len(), &desc[..200.min(desc.len())]);
+            eprintln!(
+                "  char[{}] val node: {}",
+                chars.len(),
+                &desc[..200.min(desc.len())]
+            );
         }
         // Try Scott number decoding (pair-chain binary encoding from the program)
         let ch_scott = decode_scott_num(arena, char_val, fuel_per_op * 3);
@@ -3881,7 +4824,9 @@ fn render_image_quadtree(
     fuel: &mut u64,
     count: &mut u64,
 ) {
-    if *fuel == 0 || size == 0 { return; }
+    if *fuel == 0 || size == 0 {
+        return;
+    }
 
     // Check if it's a simple boolean (uniform color)
     let is_bool = decode_bool(arena, node, (*fuel).min(200000));
@@ -4225,7 +5170,7 @@ fn render_image_quadtree(
                         let k3 = arena.alloc(K, NIL, NIL);
                         arena.alloc(APP, k3, kk_ki)
                     }
-                    _ => unreachable!()
+                    _ => unreachable!(),
                 }
             }
         }
@@ -4244,7 +5189,7 @@ fn render_image_quadtree(
         let b_val = extract_tuple5(arena, node, 0, fuel);
         let b = decode_bool(arena, b_val, (*fuel).min(200000));
         let color = match b {
-            Some(true) => 0u8,   // true = black
+            Some(true) => 0u8,    // true = black
             Some(false) => 255u8, // false = white
             None => 128u8,        // unknown
         };
@@ -4265,7 +5210,17 @@ fn render_image_quadtree(
     render_image_quadtree(arena, nw, pixels, x, y, half, img_width, fuel, count);
     render_image_quadtree(arena, ne, pixels, x + half, y, half, img_width, fuel, count);
     render_image_quadtree(arena, sw, pixels, x, y + half, half, img_width, fuel, count);
-    render_image_quadtree(arena, se, pixels, x + half, y + half, half, img_width, fuel, count);
+    render_image_quadtree(
+        arena,
+        se,
+        pixels,
+        x + half,
+        y + half,
+        half,
+        img_width,
+        fuel,
+        count,
+    );
 }
 
 /// Render diamond quadtree to pixel buffer.
@@ -4288,7 +5243,9 @@ fn render_diamond(
     fuel: &mut u64,
     count: &mut u64,
 ) {
-    if *fuel == 0 || size == 0 { return; }
+    if *fuel == 0 || size == 0 {
+        return;
+    }
 
     // Check if it's a boolean leaf
     let is_bool = decode_bool(arena, node, (*fuel).min(200000));
@@ -4311,7 +5268,7 @@ fn render_diamond(
         let cond = pair_fst(arena, node, fuel);
         let b = decode_bool(arena, cond, (*fuel).min(200000));
         let color = match b {
-            Some(true) => 0u8,   // black
+            Some(true) => 0u8,    // black
             Some(false) => 255u8, // white
             None => 128u8,        // gray (unknown)
         };
@@ -4323,19 +5280,29 @@ fn render_diamond(
     }
 
     // Diamond structure: PAIR(cond, PAIR(qa, PAIR(qb, PAIR(qc, qd))))
-    let rest = pair_snd(arena, node, fuel);       // PAIR(qa, PAIR(qb, PAIR(qc, qd)))
-    let qa = pair_fst(arena, rest, fuel);          // qa (NW: m-1, z-1)
-    let rest2 = pair_snd(arena, rest, fuel);       // PAIR(qb, PAIR(qc, qd))
-    let qb = pair_fst(arena, rest2, fuel);         // qb (NE: m-1, z+1)
-    let rest3 = pair_snd(arena, rest2, fuel);      // PAIR(qc, qd)
-    let qc = pair_fst(arena, rest3, fuel);         // qc (SW: m+1, z-1)
-    let qd = pair_snd(arena, rest3, fuel);         // qd (SE: m+1, z+1)
+    let rest = pair_snd(arena, node, fuel); // PAIR(qa, PAIR(qb, PAIR(qc, qd)))
+    let qa = pair_fst(arena, rest, fuel); // qa (NW: m-1, z-1)
+    let rest2 = pair_snd(arena, rest, fuel); // PAIR(qb, PAIR(qc, qd))
+    let qb = pair_fst(arena, rest2, fuel); // qb (NE: m-1, z+1)
+    let rest3 = pair_snd(arena, rest2, fuel); // PAIR(qc, qd)
+    let qc = pair_fst(arena, rest3, fuel); // qc (SW: m+1, z-1)
+    let qd = pair_snd(arena, rest3, fuel); // qd (SE: m+1, z+1)
 
     let half = size / 2;
     render_diamond(arena, qa, pixels, x, y, half, img_width, fuel, count);
     render_diamond(arena, qb, pixels, x + half, y, half, img_width, fuel, count);
     render_diamond(arena, qc, pixels, x, y + half, half, img_width, fuel, count);
-    render_diamond(arena, qd, pixels, x + half, y + half, half, img_width, fuel, count);
+    render_diamond(
+        arena,
+        qd,
+        pixels,
+        x + half,
+        y + half,
+        half,
+        img_width,
+        fuel,
+        count,
+    );
 }
 
 /// Alternate interpretation: PAIR(PAIR(nw, ne), PAIR(sw, se))
@@ -4350,7 +5317,9 @@ fn render_quadtree_v2(
     fuel: &mut u64,
     count: &mut u64,
 ) {
-    if *fuel == 0 || size == 0 { return; }
+    if *fuel == 0 || size == 0 {
+        return;
+    }
 
     let is_bool = decode_bool(arena, node, (*fuel).min(200000));
     match is_bool {
@@ -4386,7 +5355,17 @@ fn render_quadtree_v2(
     render_quadtree_v2(arena, nw, pixels, x, y, half, img_width, fuel, count);
     render_quadtree_v2(arena, ne, pixels, x + half, y, half, img_width, fuel, count);
     render_quadtree_v2(arena, sw, pixels, x, y + half, half, img_width, fuel, count);
-    render_quadtree_v2(arena, se, pixels, x + half, y + half, half, img_width, fuel, count);
+    render_quadtree_v2(
+        arena,
+        se,
+        pixels,
+        x + half,
+        y + half,
+        half,
+        img_width,
+        fuel,
+        count,
+    );
 }
 
 /// Render using pair1 (1-arg Scott pairs) nested:
@@ -4402,7 +5381,9 @@ fn render_pair1_nested(
     fuel: &mut u64,
     count: &mut u64,
 ) {
-    if *fuel == 0 || size == 0 { return; }
+    if *fuel == 0 || size == 0 {
+        return;
+    }
 
     let is_bool = decode_bool(arena, node, (*fuel).min(200000));
     match is_bool {
@@ -4451,7 +5432,17 @@ fn render_pair1_nested(
     render_pair1_nested(arena, qa, pixels, x, y, half, img_width, fuel, count);
     render_pair1_nested(arena, qb, pixels, x + half, y, half, img_width, fuel, count);
     render_pair1_nested(arena, qc, pixels, x, y + half, half, img_width, fuel, count);
-    render_pair1_nested(arena, qd, pixels, x + half, y + half, half, img_width, fuel, count);
+    render_pair1_nested(
+        arena,
+        qd,
+        pixels,
+        x + half,
+        y + half,
+        half,
+        img_width,
+        fuel,
+        count,
+    );
 }
 
 /// Build a 5-tuple selector in the arena: sel_i(a)(b)(c)(d)(e) = <i-th arg>
@@ -4483,8 +5474,12 @@ fn render_diamond_church(
     count: &mut u64,
     depth: usize,
 ) {
-    if *fuel == 0 || size == 0 { return; }
-    if depth > 20 { return; } // safety limit
+    if *fuel == 0 || size == 0 {
+        return;
+    }
+    if depth > 20 {
+        return;
+    } // safety limit
 
     // Check if it's a simple boolean (uniform color leaf)
     let is_bool = decode_bool(arena, node, (*fuel).min(500000));
@@ -4510,9 +5505,15 @@ fn render_diamond_church(
         let cond = arena.follow(app);
         let b = decode_bool(arena, cond, (*fuel).min(500000));
         if *count < 8 {
-            eprintln!("    pixel({},{}) depth={} cond_bool={:?} node_tag={} cond: {}",
-                x, y, depth, b, arena.nodes[arena.follow(node) as usize].tag,
-                &describe(arena, cond, 0)[..100.min(describe(arena, cond, 0).len())]);
+            eprintln!(
+                "    pixel({},{}) depth={} cond_bool={:?} node_tag={} cond: {}",
+                x,
+                y,
+                depth,
+                b,
+                arena.nodes[arena.follow(node) as usize].tag,
+                &describe(arena, cond, 0)[..100.min(describe(arena, cond, 0).len())]
+            );
         }
         let color = match b {
             Some(true) => 0u8,
@@ -4549,10 +5550,54 @@ fn render_diamond_church(
     let qd = arena.follow(app4);
 
     let half = size / 2;
-    render_diamond_church(arena, qa, pixels, x, y, half, img_width, fuel, count, depth + 1);
-    render_diamond_church(arena, qb, pixels, x + half, y, half, img_width, fuel, count, depth + 1);
-    render_diamond_church(arena, qc, pixels, x, y + half, half, img_width, fuel, count, depth + 1);
-    render_diamond_church(arena, qd, pixels, x + half, y + half, half, img_width, fuel, count, depth + 1);
+    render_diamond_church(
+        arena,
+        qa,
+        pixels,
+        x,
+        y,
+        half,
+        img_width,
+        fuel,
+        count,
+        depth + 1,
+    );
+    render_diamond_church(
+        arena,
+        qb,
+        pixels,
+        x + half,
+        y,
+        half,
+        img_width,
+        fuel,
+        count,
+        depth + 1,
+    );
+    render_diamond_church(
+        arena,
+        qc,
+        pixels,
+        x,
+        y + half,
+        half,
+        img_width,
+        fuel,
+        count,
+        depth + 1,
+    );
+    render_diamond_church(
+        arena,
+        qd,
+        pixels,
+        x + half,
+        y + half,
+        half,
+        img_width,
+        fuel,
+        count,
+        depth + 1,
+    );
 }
 
 /// Fill a rectangular region with a color.
