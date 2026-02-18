@@ -5,3 +5,4 @@ stars_compact.txt
 __pycache__
 images/*
 !images/qtree*
+ski_eval_rs/target/*
